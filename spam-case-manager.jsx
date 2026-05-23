@@ -337,6 +337,44 @@ function blobToBase64(blob) {
   });
 }
 
+// Build a base64url-encoded RFC 2822 MIME message for Gmail API's `raw` field.
+function buildMimeMessage({ to, subject, bodyText, attachment }) {
+  const enc = (str) => {
+    const bytes = new TextEncoder().encode(str);
+    let bin = "";
+    bytes.forEach((b) => (bin += String.fromCharCode(b)));
+    return btoa(bin);
+  };
+  const wrap76 = (b64) => (b64.match(/.{1,76}/g) ?? []).join("\r\n");
+  const boundary = `b_${Date.now().toString(36)}_${Math.random().toString(36).slice(2)}`;
+
+  let mime =
+    `To: ${to}\r\n` +
+    `Subject: =?UTF-8?B?${enc(subject)}?=\r\n` +
+    `MIME-Version: 1.0\r\n` +
+    `Content-Type: multipart/mixed; boundary="${boundary}"\r\n\r\n` +
+    `--${boundary}\r\n` +
+    `Content-Type: text/plain; charset=UTF-8\r\n` +
+    `Content-Transfer-Encoding: base64\r\n\r\n` +
+    wrap76(enc(bodyText)) + `\r\n`;
+
+  if (attachment) {
+    mime +=
+      `--${boundary}\r\n` +
+      `Content-Type: ${attachment.mimeType}\r\n` +
+      `Content-Disposition: attachment; filename="=?UTF-8?B?${enc(attachment.filename)}?="\r\n` +
+      `Content-Transfer-Encoding: base64\r\n\r\n` +
+      wrap76(attachment.data) + `\r\n`;
+  }
+
+  mime += `--${boundary}--`;
+
+  const mimeBytes = new TextEncoder().encode(mime);
+  let bin = "";
+  mimeBytes.forEach((b) => (bin += String.fromCharCode(b)));
+  return btoa(bin).replace(/\+/g, "-").replace(/\//g, "_").replace(/=/g, "");
+}
+
 // ─── COMPONENTS ──────────────────────────────────────────────────────────────
 
 function Badge({ stage }) {
@@ -579,12 +617,13 @@ function NewCaseModal({ onSave, onClose }) {
   );
 }
 
-function CaseDetail({ c, onUpdate, onBack }) {
+function CaseDetail({ c, onUpdate, onBack, gmailToken, onGmailToken }) {
   const [showTemplate, setShowTemplate] = useState(null);
   const [addingNote, setAddingNote] = useState(false);
   const [noteText, setNoteText] = useState("");
   const [newEventText, setNewEventText] = useState("");
   const [docxLoading, setDocxLoading] = useState(null);
+  const [connectingGmail, setConnectingGmail] = useState(false);
   const [sendingEmail, setSendingEmail] = useState(false);
   const [emailStatus, setEmailStatus] = useState(null);
   const [emailError, setEmailError] = useState(null);
@@ -630,11 +669,26 @@ function CaseDetail({ c, onUpdate, onBack }) {
     e.target.value = "";
   };
 
-  const handleSendEmail = async () => {
-    if (!c.contactEmail) {
-      alert("אין כתובת אימייל לנתבע בתיק זה.");
-      return;
+  const handleConnectGmail = async () => {
+    setConnectingGmail(true);
+    setEmailError(null);
+    try {
+      const provider = new GoogleAuthProvider();
+      provider.addScope("https://www.googleapis.com/auth/gmail.compose");
+      const result = await signInWithPopup(auth, provider);
+      const credential = GoogleAuthProvider.credentialFromResult(result);
+      onGmailToken(credential.accessToken);
+    } catch (err) {
+      if (err.code !== "auth/popup-closed-by-user") {
+        setEmailError(err.message);
+      }
+    } finally {
+      setConnectingGmail(false);
     }
+  };
+
+  const handleCreateDraft = async () => {
+    if (!c.contactEmail) return;
     setSendingEmail(true);
     setEmailStatus(null);
     setEmailError(null);
@@ -657,17 +711,26 @@ function CaseDetail({ c, onUpdate, onBack }) {
       }
 
       const subject = `התראה בטרם נקיטת הליכים — תיק #${c.caseNumber}`;
-      const body = `שלום רב,\nמצ״ב התראה בטרם נקיטת הליכים בעניין משלוח דברי פרסומת ללא הסכמה.\nאנא עיינו במסמך המצורף ופנו אלינו תוך 14 ימים.\n\nבכבוד רב,\nאשר דיבה, עו״ד | 052-3699372 | asherdiba@gmail.com`;
+      const bodyText = `שלום רב,\nמצ״ב התראה בטרם נקיטת הליכים בעניין משלוח דברי פרסומת ללא הסכמה.\nאנא עיינו במסמך המצורף ופנו אלינו תוך 14 ימים.\n\nבכבוד רב,\nאשר דיבה, עו״ד | 052-3699372 | asherdiba@gmail.com`;
 
-      const res = await fetch("/send-email", {
+      const raw = buildMimeMessage({ to: c.contactEmail, subject, bodyText, attachment });
+
+      const res = await fetch("https://gmail.googleapis.com/gmail/v1/users/me/drafts", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ to: c.contactEmail, subject, body, attachment }),
+        headers: {
+          Authorization: `Bearer ${gmailToken}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ message: { raw } }),
       });
 
+      if (res.status === 401) {
+        onGmailToken(null);
+        throw new Error("פג תוקף החיבור ל-Gmail. אנא חבר מחדש.");
+      }
       if (!res.ok) {
-        const msg = await res.text();
-        throw new Error(msg);
+        const errData = await res.json().catch(() => ({}));
+        throw new Error(errData.error?.message ?? `Gmail API error ${res.status}`);
       }
 
       const today = new Date().toISOString().split("T")[0];
@@ -870,48 +933,94 @@ function CaseDetail({ c, onUpdate, onBack }) {
       {/* Send to defendant */}
       <div style={{ background: "#fff", border: "1px solid #E5E7EB", borderRadius: 14, padding: 20 }}>
         <div style={{ fontSize: 13, fontWeight: 700, color: "#374151", marginBottom: 14 }}>שליחה לנתבע</div>
-        {c.contactEmail ? (
-          <>
-            <div style={{ fontSize: 12, color: "#6B7280", marginBottom: 12, lineHeight: 1.6 }}>
-              <span>שליחת התראה אל: </span>
-              <strong>{c.contactEmail}</strong>
-              {c.uploadedDocument
-                ? <span style={{ color: "#10B981", marginRight: 8 }}> · מסמך מועלה יצורף</span>
-                : <span style={{ color: "#9CA3AF", marginRight: 8 }}> · התראה תיווצר כ-DOCX אוטומטית</span>
-              }
+
+        {/* Gmail connection status */}
+        <div style={{ marginBottom: 14 }}>
+          {gmailToken ? (
+            <div style={{ display: "flex", alignItems: "center", gap: 10, fontSize: 12 }}>
+              <span style={{ color: "#10B981", fontWeight: 700 }}>✓ Gmail מחובר</span>
+              <button
+                onClick={() => { onGmailToken(null); setEmailStatus(null); }}
+                style={{ background: "none", border: "none", color: "#9CA3AF", cursor: "pointer", fontSize: 12, textDecoration: "underline", padding: 0 }}
+              >
+                נתק
+              </button>
             </div>
-            {emailStatus === "sent" && (
-              <div style={{
-                background: "#F0FDF4", border: "1px solid #BBF7D0", borderRadius: 8,
-                padding: "10px 14px", marginBottom: 12, color: "#065F46", fontSize: 13,
-              }}>
-                ✓ הטיוטה נוצרה ב-Gmail — שלב התיק עודכן לאחר "התראה נשלחה"
+          ) : (
+            <div>
+              <div style={{ fontSize: 12, color: "#6B7280", marginBottom: 8 }}>
+                חבר את חשבון Gmail כדי ליצור טיוטת מייל לנתבע ישירות מהאפליקציה.
               </div>
-            )}
-            {emailStatus === "error" && (
-              <div style={{
-                background: "#FEF2F2", border: "1px solid #FCA5A5", borderRadius: 8,
-                padding: "10px 14px", marginBottom: 12, color: "#991B1B", fontSize: 13,
-              }}>
-                שגיאה בשליחה: {emailError}
+              <button
+                onClick={handleConnectGmail}
+                disabled={connectingGmail}
+                style={{
+                  padding: "8px 18px",
+                  background: connectingGmail ? "#9CA3AF" : "#fff",
+                  color: connectingGmail ? "#fff" : "#374151",
+                  border: "1px solid #D1D5DB", borderRadius: 8,
+                  fontWeight: 600, fontSize: 13,
+                  cursor: connectingGmail ? "not-allowed" : "pointer",
+                  display: "flex", alignItems: "center", gap: 8,
+                }}
+              >
+                <img src="https://www.gstatic.com/firebasejs/ui/2.0.0/images/auth/google.svg" alt="" style={{ width: 16, height: 16 }} />
+                {connectingGmail ? "מתחבר..." : "חבר Gmail"}
+              </button>
+            </div>
+          )}
+        </div>
+
+        {/* Draft creation — only shown when Gmail is connected and case has email */}
+        {gmailToken && (
+          c.contactEmail ? (
+            <>
+              <div style={{ fontSize: 12, color: "#6B7280", marginBottom: 12, lineHeight: 1.6 }}>
+                <span>יצירת טיוטה אל: </span>
+                <strong>{c.contactEmail}</strong>
+                {c.uploadedDocument
+                  ? <span style={{ color: "#10B981", marginRight: 8 }}> · מסמך מועלה יצורף</span>
+                  : <span style={{ color: "#9CA3AF", marginRight: 8 }}> · התראה תיווצר כ-DOCX אוטומטית</span>
+                }
               </div>
-            )}
-            <button
-              onClick={handleSendEmail}
-              disabled={sendingEmail}
-              style={{
-                padding: "10px 22px",
-                background: sendingEmail ? "#9CA3AF" : "#7C3AED",
-                color: "#fff", border: "none", borderRadius: 8,
-                fontWeight: 700, fontSize: 14,
-                cursor: sendingEmail ? "not-allowed" : "pointer",
-              }}
-            >
-              {sendingEmail ? "⏳ שולח..." : "✉️ שלח PDF לנתבע"}
-            </button>
-          </>
-        ) : (
-          <div style={{ fontSize: 13, color: "#9CA3AF" }}>אין כתובת אימייל לנתבע בתיק זה.</div>
+              {emailStatus === "sent" && (
+                <div style={{
+                  background: "#F0FDF4", border: "1px solid #BBF7D0", borderRadius: 8,
+                  padding: "10px 14px", marginBottom: 12, color: "#065F46", fontSize: 13,
+                  display: "flex", alignItems: "center", justifyContent: "space-between",
+                }}>
+                  <span>✓ הטיוטה נוצרה ב-Gmail — שלב התיק עודכן</span>
+                  <a href="https://mail.google.com/#drafts" target="_blank" rel="noopener noreferrer"
+                    style={{ color: "#059669", fontSize: 12, fontWeight: 600 }}>
+                    פתח Gmail ←
+                  </a>
+                </div>
+              )}
+              {emailStatus === "error" && (
+                <div style={{
+                  background: "#FEF2F2", border: "1px solid #FCA5A5", borderRadius: 8,
+                  padding: "10px 14px", marginBottom: 12, color: "#991B1B", fontSize: 13,
+                }}>
+                  שגיאה: {emailError}
+                </div>
+              )}
+              <button
+                onClick={handleCreateDraft}
+                disabled={sendingEmail}
+                style={{
+                  padding: "10px 22px",
+                  background: sendingEmail ? "#9CA3AF" : "#7C3AED",
+                  color: "#fff", border: "none", borderRadius: 8,
+                  fontWeight: 700, fontSize: 14,
+                  cursor: sendingEmail ? "not-allowed" : "pointer",
+                }}
+              >
+                {sendingEmail ? "⏳ יוצר טיוטה..." : "✉️ צור טיוטה ב-Gmail"}
+              </button>
+            </>
+          ) : (
+            <div style={{ fontSize: 13, color: "#9CA3AF" }}>אין כתובת אימייל לנתבע בתיק זה.</div>
+          )
         )}
       </div>
     </div>
@@ -929,6 +1038,7 @@ export default function App() {
   const [user, setUser] = useState(null);
   const [authLoading, setAuthLoading] = useState(true);
   const [loaded, setLoaded] = useState(false);
+  const [gmailToken, setGmailToken] = useState(null);
 
   useEffect(() => {
     return onAuthStateChanged(auth, (u) => {
@@ -1023,6 +1133,8 @@ export default function App() {
           c={selectedCase}
           onUpdate={updateCase}
           onBack={() => setSelectedCase(null)}
+          gmailToken={gmailToken}
+          onGmailToken={setGmailToken}
         />
       </div>
     );
