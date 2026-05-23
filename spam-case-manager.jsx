@@ -337,6 +337,61 @@ function blobToBase64(blob) {
   });
 }
 
+// Generate a PDF blob directly from case text using browser canvas rendering.
+// The browser handles Hebrew RTL natively — no external service needed.
+async function buildPdfBlob(c, type) {
+  const { jsPDF } = await import("jspdf");
+  const text = type === "warning" ? generateWarningLetter(c) : generateLawsuit(c);
+  const lines = text.split("\n");
+
+  const PAGE_W = 210, PAGE_H = 297, MARGIN = 20;
+  const CONTENT_W = PAGE_W - 2 * MARGIN;
+  const CONTENT_H = PAGE_H - 2 * MARGIN;
+  const LINE_H = 6; // mm per line
+  const LINES_PER_PAGE = Math.floor(CONTENT_H / LINE_H);
+  const DPI = 150;
+  const MM2PX = DPI / 25.4;
+
+  const canvas = document.createElement("canvas");
+  canvas.width = Math.round(CONTENT_W * MM2PX);
+  canvas.height = Math.round(CONTENT_H * MM2PX);
+  const ctx = canvas.getContext("2d");
+  ctx.fillStyle = "#000";
+
+  const doc = new jsPDF({ unit: "mm", format: "a4" });
+
+  // Chunk lines into pages
+  for (let page = 0; page * LINES_PER_PAGE < lines.length; page++) {
+    if (page > 0) doc.addPage();
+    const pageLines = lines.slice(page * LINES_PER_PAGE, (page + 1) * LINES_PER_PAGE);
+
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+    pageLines.forEach((line, i) => {
+      const globalIdx = page * LINES_PER_PAGE + i;
+      const isBold =
+        (type === "warning" && globalIdx <= 5) ||
+        line === "הנדון: התראה בטרם נקיטת הליכים" ||
+        line === "כתב תביעה" ||
+        line.startsWith("פרטי התביעה") ||
+        /^(התובע|הנתבעת|בית משפט לתביעות קטנות)/.test(line);
+      const isCentered = line === "כתב תביעה" || line === "- נ ג ד -" || line === "בכפר סבא";
+
+      const fontPx = (isBold ? 13 : 11) * MM2PX * 0.352; // pt → mm → px
+      ctx.font = `${isBold ? "bold " : ""}${fontPx}px Arial`;
+      ctx.direction = "rtl";
+      ctx.textAlign = isCentered ? "center" : "right";
+      const x = isCentered ? canvas.width / 2 : canvas.width;
+      const y = (i + 0.75) * LINE_H * MM2PX;
+      ctx.fillText(line || " ", x, y);
+    });
+
+    doc.addImage(canvas.toDataURL("image/png"), "PNG", MARGIN, MARGIN, CONTENT_W, CONTENT_H);
+  }
+
+  return doc.output("blob");
+}
+
 // Build a base64url-encoded RFC 2822 MIME message for Gmail API's `raw` field.
 // attachments: array of { filename, mimeType, data (base64) }
 function buildMimeMessage({ to, subject, bodyText, attachments = [] }) {
@@ -694,32 +749,11 @@ function CaseDetail({ c, onUpdate, onBack, gmailToken, onGmailToken }) {
     setEmailStatus(null);
     setEmailError(null);
     try {
-      const DOCX_MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
-
-      // Attachment 1: warning letter — use uploaded doc if present, else generate
-      let warningAttachment;
-      if (c.uploadedDocument?.data) {
-        warningAttachment = {
-          filename: c.uploadedDocument.name,
-          mimeType: c.uploadedDocument.type,
-          data: c.uploadedDocument.data,
-        };
-      } else {
-        const blob = await buildDocxBlob(c, "warning");
-        warningAttachment = {
-          filename: `מכתב_התראה_תיק_${c.caseNumber}.docx`,
-          mimeType: DOCX_MIME,
-          data: await blobToBase64(blob),
-        };
-      }
-
-      // Attachment 2: lawsuit draft — always generated
-      const lawsuitBlob = await buildDocxBlob(c, "lawsuit");
-      const lawsuitAttachment = {
-        filename: `טיוטת_כתב_תביעה_תיק_${c.caseNumber}.docx`,
-        mimeType: DOCX_MIME,
-        data: await blobToBase64(lawsuitBlob),
-      };
+      // Generate both PDFs in parallel directly in the browser
+      const [warningPdfB64, lawsuitPdfB64] = await Promise.all([
+        buildPdfBlob(c, "warning").then(blobToBase64),
+        buildPdfBlob(c, "lawsuit").then(blobToBase64),
+      ]);
 
       const subject = `התראה בטרם נקיטת הליכים — תיק #${c.caseNumber}`;
       const bodyText = `שלום רב,\nמצ״ב התראה בטרם נקיטת הליכים בעניין משלוח דברי פרסומת ללא הסכמה.\nאנא עיינו במסמך המצורף ופנו אלינו תוך 14 ימים.\n\nבכבוד רב,\nאשר דיבה, עו״ד | 052-3699372 | asherdiba@gmail.com`;
@@ -728,7 +762,10 @@ function CaseDetail({ c, onUpdate, onBack, gmailToken, onGmailToken }) {
         to: c.contactEmail,
         subject,
         bodyText,
-        attachments: [warningAttachment, lawsuitAttachment],
+        attachments: [
+          { filename: `מכתב_התראה_תיק_${c.caseNumber}.pdf`, mimeType: "application/pdf", data: warningPdfB64 },
+          { filename: `טיוטת_כתב_תביעה_תיק_${c.caseNumber}.pdf`, mimeType: "application/pdf", data: lawsuitPdfB64 },
+        ],
       });
 
       const res = await fetch("https://gmail.googleapis.com/gmail/v1/users/me/drafts", {
