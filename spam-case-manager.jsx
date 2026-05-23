@@ -272,7 +272,7 @@ async function buildDocxBlob(c, type, signature = null) {
         const sigFit = fitImg(sigDimsDocx.w, sigDimsDocx.h, 180);
         children.push(new Paragraph({
           bidirectional: true,
-          alignment: AlignmentType.RIGHT,
+          alignment: AlignmentType.START,
           spacing: { before: 40, after: 40 },
           children: [new ImageRun({ data: toBytes(signature), transformation: sigFit, type: "png" })],
         }));
@@ -489,7 +489,8 @@ async function buildPdfBlob(c, type, signature = null) {
       const sigY = MARGIN + rowInPage * LINE_H;
       const sigW = 55; // ~55 mm ≈ realistic signature width
       const sigH = sigW * sigDimsPdf.h / sigDimsPdf.w;
-      doc.addImage(signature, "PNG", MARGIN, sigY, sigW, sigH);
+      const sigX = PAGE_W - MARGIN - sigW; // right-aligned, same edge as Hebrew text
+      doc.addImage(signature, "PNG", sigX, sigY, sigW, sigH);
     }
   }
 
