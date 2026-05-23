@@ -228,16 +228,18 @@ ${nextSectionNum + 1}. אשר על כן, מתבקש בית המשפט הנכבד
 // ─── DOCX HELPERS ────────────────────────────────────────────────────────────
 
 async function buildDocxBlob(c, type) {
-  const { Document, Packer, Paragraph, TextRun, AlignmentType } = await import("docx");
+  const [{ Document, Packer, Paragraph, TextRun, AlignmentType }, JSZip] =
+    await Promise.all([import("docx"), import("jszip").then(m => m.default)]);
+
   const text = type === "warning" ? generateWarningLetter(c) : generateLawsuit(c);
   const lines = text.split("\n");
+  const FONT = "David";
 
-  const mkRun = (text, bold) =>
+  const mkRun = (line, bold) =>
     new TextRun({
-      text: text || "​",
-      // docx v9: property is `rightToLeft`, not `rtl`
-      rightToLeft: true,
-      font: { name: "David", cs: "David" },
+      text: line || "​",
+      rightToLeft: true,                      // docx v9 renamed from `rtl`
+      font: { name: FONT, cs: FONT },         // cs = complex-script (Hebrew) font
       size: bold ? 26 : 24,
       sizeComplexScript: bold ? 26 : 24,
       bold,
@@ -254,8 +256,7 @@ async function buildDocxBlob(c, type) {
     const isSectionHeader =
       /^(התובע|הנתבעת|בית משפט לתביעות קטנות)/.test(line) ||
       line === "בכפר סבא";
-    const isCentered =
-      line === "כתב תביעה" || line === "- נ ג ד -" || line === "בכפר סבא";
+    const isCentered = line === "כתב תביעה" || line === "- נ ג ד -" || line === "בכפר סבא";
     const bold = isSenderHeader || isDocTitle || isSectionHeader;
 
     return new Paragraph({
@@ -267,29 +268,45 @@ async function buildDocxBlob(c, type) {
   });
 
   const doc = new Document({
-    // Document-level defaults: every paragraph and run is RTL Hebrew by default
     styles: {
+      // Document-level run/paragraph defaults
       default: {
         document: {
           run: {
             rightToLeft: true,
-            font: { name: "David", cs: "David" },
+            font: { name: FONT, cs: FONT },
             size: 24,
             sizeComplexScript: 24,
             language: { bidirectional: "he-IL" },
           },
-          paragraph: {
-            bidirectional: true,
-            alignment: AlignmentType.RIGHT,
-          },
+          paragraph: { bidirectional: true, alignment: AlignmentType.RIGHT },
         },
       },
+      // Explicit Normal style — without this Word auto-generates a LTR Normal
+      // on first open, which all other styles inherit from
+      paragraphStyles: [
+        {
+          id: "Normal",
+          name: "Normal",
+          quickFormat: true,
+          paragraph: {
+            bidirectional: "1",           // string form required for style definitions
+            alignment: AlignmentType.RIGHT,
+          },
+          run: {
+            rightToLeft: true,
+            font: { name: FONT, cs: FONT },
+            size: 24,
+            sizeComplexScript: 24,
+          },
+        },
+      ],
     },
     sections: [
       {
         properties: {
           page: {
-            size: { width: 11906, height: 16838 },
+            size: { width: 11906, height: 16838 },   // A4 in twips
             margin: { top: 1440, right: 1440, bottom: 1440, left: 1440 },
           },
         },
@@ -298,7 +315,17 @@ async function buildDocxBlob(c, type) {
     ],
   });
 
-  return Packer.toBlob(doc);
+  // docx v9 has no API for section-level <w:bidi/>.
+  // Without it Word treats the whole document as LTR layout (cursor direction,
+  // ruler, new-paragraph defaults). Post-process the zip to inject it.
+  const initialBlob = await Packer.toBlob(doc);
+  const zip = await JSZip.loadAsync(initialBlob);
+  const docXml = await zip.file("word/document.xml").async("string");
+  zip.file("word/document.xml", docXml.replace("</w:sectPr>", "<w:bidi/></w:sectPr>"));
+  return zip.generateAsync({
+    type: "blob",
+    mimeType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  });
 }
 
 function blobToBase64(blob) {
