@@ -338,7 +338,8 @@ function blobToBase64(blob) {
 }
 
 // Build a base64url-encoded RFC 2822 MIME message for Gmail API's `raw` field.
-function buildMimeMessage({ to, subject, bodyText, attachment }) {
+// attachments: array of { filename, mimeType, data (base64) }
+function buildMimeMessage({ to, subject, bodyText, attachments = [] }) {
   const enc = (str) => {
     const bytes = new TextEncoder().encode(str);
     let bin = "";
@@ -358,13 +359,13 @@ function buildMimeMessage({ to, subject, bodyText, attachment }) {
     `Content-Transfer-Encoding: base64\r\n\r\n` +
     wrap76(enc(bodyText)) + `\r\n`;
 
-  if (attachment) {
+  for (const att of attachments) {
     mime +=
       `--${boundary}\r\n` +
-      `Content-Type: ${attachment.mimeType}\r\n` +
-      `Content-Disposition: attachment; filename="=?UTF-8?B?${enc(attachment.filename)}?="\r\n` +
+      `Content-Type: ${att.mimeType}\r\n` +
+      `Content-Disposition: attachment; filename="=?UTF-8?B?${enc(att.filename)}?="\r\n` +
       `Content-Transfer-Encoding: base64\r\n\r\n` +
-      wrap76(attachment.data) + `\r\n`;
+      wrap76(att.data) + `\r\n`;
   }
 
   mime += `--${boundary}--`;
@@ -693,27 +694,42 @@ function CaseDetail({ c, onUpdate, onBack, gmailToken, onGmailToken }) {
     setEmailStatus(null);
     setEmailError(null);
     try {
-      let attachment;
+      const DOCX_MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
+
+      // Attachment 1: warning letter — use uploaded doc if present, else generate
+      let warningAttachment;
       if (c.uploadedDocument?.data) {
-        attachment = {
+        warningAttachment = {
           filename: c.uploadedDocument.name,
           mimeType: c.uploadedDocument.type,
           data: c.uploadedDocument.data,
         };
       } else {
         const blob = await buildDocxBlob(c, "warning");
-        const data = await blobToBase64(blob);
-        attachment = {
-          filename: `התראה_${c.caseNumber}.docx`,
-          mimeType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-          data,
+        warningAttachment = {
+          filename: `מכתב_התראה_תיק_${c.caseNumber}.docx`,
+          mimeType: DOCX_MIME,
+          data: await blobToBase64(blob),
         };
       }
+
+      // Attachment 2: lawsuit draft — always generated
+      const lawsuitBlob = await buildDocxBlob(c, "lawsuit");
+      const lawsuitAttachment = {
+        filename: `טיוטת_כתב_תביעה_תיק_${c.caseNumber}.docx`,
+        mimeType: DOCX_MIME,
+        data: await blobToBase64(lawsuitBlob),
+      };
 
       const subject = `התראה בטרם נקיטת הליכים — תיק #${c.caseNumber}`;
       const bodyText = `שלום רב,\nמצ״ב התראה בטרם נקיטת הליכים בעניין משלוח דברי פרסומת ללא הסכמה.\nאנא עיינו במסמך המצורף ופנו אלינו תוך 14 ימים.\n\nבכבוד רב,\nאשר דיבה, עו״ד | 052-3699372 | asherdiba@gmail.com`;
 
-      const raw = buildMimeMessage({ to: c.contactEmail, subject, bodyText, attachment });
+      const raw = buildMimeMessage({
+        to: c.contactEmail,
+        subject,
+        bodyText,
+        attachments: [warningAttachment, lawsuitAttachment],
+      });
 
       const res = await fetch("https://gmail.googleapis.com/gmail/v1/users/me/drafts", {
         method: "POST",
