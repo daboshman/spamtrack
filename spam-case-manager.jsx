@@ -261,7 +261,7 @@ async function buildDocxBlob(c, type) {
 
     return new Paragraph({
       bidirectional: true,
-      alignment: isCentered ? AlignmentType.CENTER : AlignmentType.RIGHT,
+      alignment: isCentered ? AlignmentType.CENTER : AlignmentType.START,
       spacing: line.trim() === "" ? { after: 120 } : { after: 40 },
       children: [mkRun(line, bold)],
     });
@@ -279,7 +279,7 @@ async function buildDocxBlob(c, type) {
             sizeComplexScript: 24,
             language: { bidirectional: "he-IL" },
           },
-          paragraph: { bidirectional: true, alignment: AlignmentType.RIGHT },
+          paragraph: { bidirectional: true, alignment: AlignmentType.START },
         },
       },
       // Explicit Normal style — without this Word auto-generates a LTR Normal
@@ -291,7 +291,7 @@ async function buildDocxBlob(c, type) {
           quickFormat: true,
           paragraph: {
             bidirectional: "1",           // string form required for style definitions
-            alignment: AlignmentType.RIGHT,
+            alignment: AlignmentType.START,
           },
           run: {
             rightToLeft: true,
