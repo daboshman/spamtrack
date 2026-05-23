@@ -1,7 +1,9 @@
 {
   "permissions": {
     "allow": [
-      "Bash(npm install:*)"
+      "Bash(npm install:*)",
+      "PowerShell(Get-ChildItem \"c:\\\\claude projects\\\\spam project\\\\src\" -Recurse | ForEach-Object { $_.FullName.Replace\\(\"c:\\\\claude projects\\\\spam project\\\\\", \"\"\\) })",
+      "PowerShell(Get-ChildItem \"c:\\\\claude projects\\\\spam project\\\\src\\\\components\" | ForEach-Object { $_.Name })"
     ]
   }
 }
