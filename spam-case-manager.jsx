@@ -232,6 +232,19 @@ async function buildDocxBlob(c, type) {
   const text = type === "warning" ? generateWarningLetter(c) : generateLawsuit(c);
   const lines = text.split("\n");
 
+  const mkRun = (text, bold) =>
+    new TextRun({
+      text: text || "​",
+      // docx v9: property is `rightToLeft`, not `rtl`
+      rightToLeft: true,
+      font: { name: "David", cs: "David" },
+      size: bold ? 26 : 24,
+      sizeComplexScript: bold ? 26 : 24,
+      bold,
+      boldComplexScript: bold,
+      language: { bidirectional: "he-IL" },
+    });
+
   const children = lines.map((line, idx) => {
     const isSenderHeader = type === "warning" && idx <= 5;
     const isDocTitle =
@@ -249,19 +262,29 @@ async function buildDocxBlob(c, type) {
       bidirectional: true,
       alignment: isCentered ? AlignmentType.CENTER : AlignmentType.RIGHT,
       spacing: line.trim() === "" ? { after: 120 } : { after: 40 },
-      children: [
-        new TextRun({
-          text: line || "​",
-          font: "David",
-          size: bold ? 26 : 24,
-          bold,
-          rtl: true,
-        }),
-      ],
+      children: [mkRun(line, bold)],
     });
   });
 
   const doc = new Document({
+    // Document-level defaults: every paragraph and run is RTL Hebrew by default
+    styles: {
+      default: {
+        document: {
+          run: {
+            rightToLeft: true,
+            font: { name: "David", cs: "David" },
+            size: 24,
+            sizeComplexScript: 24,
+            language: { bidirectional: "he-IL" },
+          },
+          paragraph: {
+            bidirectional: true,
+            alignment: AlignmentType.RIGHT,
+          },
+        },
+      },
+    },
     sections: [
       {
         properties: {
