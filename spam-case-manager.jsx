@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import { db, auth } from "./src/firebase";
 import { doc, getDoc, setDoc } from "firebase/firestore";
 import { GoogleAuthProvider, signInWithPopup, signOut, onAuthStateChanged } from "firebase/auth";
@@ -223,6 +223,68 @@ ${nextSectionNum + 1}. אשר על כן, מתבקש בית המשפט הנכבד
 
 נספח 1
 [צילומי מסך מצ"ב]`;
+}
+
+// ─── DOCX HELPERS ────────────────────────────────────────────────────────────
+
+async function buildDocxBlob(c, type) {
+  const { Document, Packer, Paragraph, TextRun, AlignmentType } = await import("docx");
+  const text = type === "warning" ? generateWarningLetter(c) : generateLawsuit(c);
+  const lines = text.split("\n");
+
+  const children = lines.map((line, idx) => {
+    const isSenderHeader = type === "warning" && idx <= 5;
+    const isDocTitle =
+      line === "כתב תביעה" ||
+      line === "הנדון: התראה בטרם נקיטת הליכים" ||
+      line.startsWith("פרטי התביעה");
+    const isSectionHeader =
+      /^(התובע|הנתבעת|בית משפט לתביעות קטנות)/.test(line) ||
+      line === "בכפר סבא";
+    const isCentered =
+      line === "כתב תביעה" || line === "- נ ג ד -" || line === "בכפר סבא";
+    const bold = isSenderHeader || isDocTitle || isSectionHeader;
+
+    return new Paragraph({
+      bidirectional: true,
+      alignment: isCentered ? AlignmentType.CENTER : AlignmentType.RIGHT,
+      spacing: line.trim() === "" ? { after: 120 } : { after: 40 },
+      children: [
+        new TextRun({
+          text: line || "​",
+          font: "David",
+          size: bold ? 26 : 24,
+          bold,
+          rtl: true,
+        }),
+      ],
+    });
+  });
+
+  const doc = new Document({
+    sections: [
+      {
+        properties: {
+          page: {
+            size: { width: 11906, height: 16838 },
+            margin: { top: 1440, right: 1440, bottom: 1440, left: 1440 },
+          },
+        },
+        children,
+      },
+    ],
+  });
+
+  return Packer.toBlob(doc);
+}
+
+function blobToBase64(blob) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result.split(",")[1]);
+    reader.onerror = reject;
+    reader.readAsDataURL(blob);
+  });
 }
 
 // ─── COMPONENTS ──────────────────────────────────────────────────────────────
@@ -472,6 +534,109 @@ function CaseDetail({ c, onUpdate, onBack }) {
   const [addingNote, setAddingNote] = useState(false);
   const [noteText, setNoteText] = useState("");
   const [newEventText, setNewEventText] = useState("");
+  const [docxLoading, setDocxLoading] = useState(null);
+  const [sendingEmail, setSendingEmail] = useState(false);
+  const [emailStatus, setEmailStatus] = useState(null);
+  const [emailError, setEmailError] = useState(null);
+  const fileInputRef = useRef(null);
+
+  const handleDownloadDocx = async (type) => {
+    setDocxLoading(type);
+    try {
+      const blob = await buildDocxBlob(c, type);
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = type === "warning"
+        ? `התראה_תיק_${c.caseNumber}.docx`
+        : `כתב_תביעה_${c.caseNumber}.docx`;
+      a.click();
+      setTimeout(() => URL.revokeObjectURL(url), 2000);
+    } catch (err) {
+      console.error("DOCX generation failed:", err);
+      alert("שגיאה ביצירת המסמך. נסה שוב.");
+    } finally {
+      setDocxLoading(null);
+    }
+  };
+
+  const handleFileUpload = (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = (evt) => {
+      const base64 = evt.target.result.split(",")[1];
+      onUpdate({
+        ...c,
+        uploadedDocument: {
+          name: file.name,
+          type: file.type,
+          uploadedAt: new Date().toISOString().split("T")[0],
+          data: base64,
+        },
+      });
+    };
+    reader.readAsDataURL(file);
+    e.target.value = "";
+  };
+
+  const handleSendEmail = async () => {
+    if (!c.contactEmail) {
+      alert("אין כתובת אימייל לנתבע בתיק זה.");
+      return;
+    }
+    setSendingEmail(true);
+    setEmailStatus(null);
+    setEmailError(null);
+    try {
+      let attachment;
+      if (c.uploadedDocument?.data) {
+        attachment = {
+          filename: c.uploadedDocument.name,
+          mimeType: c.uploadedDocument.type,
+          data: c.uploadedDocument.data,
+        };
+      } else {
+        const blob = await buildDocxBlob(c, "warning");
+        const data = await blobToBase64(blob);
+        attachment = {
+          filename: `התראה_${c.caseNumber}.docx`,
+          mimeType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+          data,
+        };
+      }
+
+      const subject = `התראה בטרם נקיטת הליכים — תיק #${c.caseNumber}`;
+      const body = `שלום רב,\nמצ״ב התראה בטרם נקיטת הליכים בעניין משלוח דברי פרסומת ללא הסכמה.\nאנא עיינו במסמך המצורף ופנו אלינו תוך 14 ימים.\n\nבכבוד רב,\nאשר דיבה, עו״ד | 052-3699372 | asherdiba@gmail.com`;
+
+      const res = await fetch("/send-email", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ to: c.contactEmail, subject, body, attachment }),
+      });
+
+      if (!res.ok) {
+        const msg = await res.text();
+        throw new Error(msg);
+      }
+
+      const today = new Date().toISOString().split("T")[0];
+      onUpdate({
+        ...c,
+        stage: "prelegal",
+        timeline: [
+          ...c.timeline,
+          { date: today, action: "מכתב התראה נשלח בדוא״ל לנתבע", type: "prelegal" },
+        ],
+      });
+      setEmailStatus("sent");
+    } catch (err) {
+      setEmailStatus("error");
+      setEmailError(err.message);
+    } finally {
+      setSendingEmail(false);
+    }
+  };
 
   const moveStage = (stageId) => onUpdate({ ...c, stage: stageId });
 
@@ -551,6 +716,26 @@ function CaseDetail({ c, onUpdate, onBack }) {
             padding: "9px 16px", background: "#EDE9FE", color: "#5B21B6",
             border: "1px solid #DDD6FE", borderRadius: 8, fontWeight: 600, cursor: "pointer", fontSize: 13,
           }}>📄 צור כתב תביעה</button>
+          <button
+            onClick={() => handleDownloadDocx("warning")}
+            disabled={!!docxLoading}
+            style={{
+              padding: "9px 16px", background: "#FFF7ED", color: "#9A3412",
+              border: "1px solid #FED7AA", borderRadius: 8, fontWeight: 600,
+              cursor: docxLoading ? "not-allowed" : "pointer", fontSize: 13,
+              opacity: docxLoading === "warning" ? 0.6 : 1,
+            }}
+          >{docxLoading === "warning" ? "⏳ מכין..." : "📥 הורד DOCX — התראה"}</button>
+          <button
+            onClick={() => handleDownloadDocx("lawsuit")}
+            disabled={!!docxLoading}
+            style={{
+              padding: "9px 16px", background: "#EEF2FF", color: "#3730A3",
+              border: "1px solid #C7D2FE", borderRadius: 8, fontWeight: 600,
+              cursor: docxLoading ? "not-allowed" : "pointer", fontSize: 13,
+              opacity: docxLoading === "lawsuit" ? 0.6 : 1,
+            }}
+          >{docxLoading === "lawsuit" ? "⏳ מכין..." : "📥 הורד DOCX — כתב תביעה"}</button>
           {stageActions.map(a => (
             <button key={a.id} onClick={() => { moveStage(a.id); addEvent(a.label, a.eventType); }} style={{
               padding: "9px 16px", background: "#F0FDF4", color: "#065F46",
@@ -558,6 +743,41 @@ function CaseDetail({ c, onUpdate, onBack }) {
             }}>✓ {a.label}</button>
           ))}
         </div>
+      </div>
+
+      {/* Documents */}
+      <div style={{ background: "#fff", border: "1px solid #E5E7EB", borderRadius: 14, padding: 20, marginBottom: 16 }}>
+        <div style={{ fontSize: 13, fontWeight: 700, color: "#374151", marginBottom: 14 }}>מסמכים</div>
+        {c.uploadedDocument && (
+          <div style={{
+            display: "flex", alignItems: "center", gap: 10,
+            background: "#F0FDF4", border: "1px solid #BBF7D0",
+            borderRadius: 8, padding: "10px 14px", marginBottom: 12,
+          }}>
+            <span style={{ color: "#10B981", fontSize: 16 }}>✓</span>
+            <div>
+              <div style={{ fontSize: 13, fontWeight: 600, color: "#065F46" }}>{c.uploadedDocument.name}</div>
+              <div style={{ fontSize: 11, color: "#9CA3AF" }}>הועלה: {c.uploadedDocument.uploadedAt}</div>
+            </div>
+          </div>
+        )}
+        <input
+          ref={fileInputRef}
+          type="file"
+          accept=".docx,.pdf"
+          style={{ display: "none" }}
+          onChange={handleFileUpload}
+        />
+        <button
+          onClick={() => fileInputRef.current.click()}
+          style={{
+            padding: "9px 16px", background: "#F9FAFB", color: "#374151",
+            border: "1px solid #D1D5DB", borderRadius: 8, fontWeight: 600,
+            cursor: "pointer", fontSize: 13,
+          }}
+        >
+          {c.uploadedDocument ? "🔄 החלף מסמך" : "📤 העלה מסמך ערוך (.docx / .pdf)"}
+        </button>
       </div>
 
       {/* Timeline */}
@@ -591,10 +811,58 @@ function CaseDetail({ c, onUpdate, onBack }) {
       )}
 
       {/* Notes */}
-      <div style={{ background: "#fff", border: "1px solid #E5E7EB", borderRadius: 14, padding: 20 }}>
+      <div style={{ background: "#fff", border: "1px solid #E5E7EB", borderRadius: 14, padding: 20, marginBottom: 16 }}>
         <div style={{ fontSize: 13, fontWeight: 700, color: "#374151", marginBottom: 10 }}>הערות</div>
         <div style={{ fontSize: 13, color: "#6B7280", lineHeight: 1.7, direction: "rtl" }}>{c.notes || "אין הערות."}</div>
         <div style={{ marginTop: 10, fontSize: 12, color: "#9CA3AF" }}>כתובת: {c.contactAddress} · {c.contactEmail}</div>
+      </div>
+
+      {/* Send to defendant */}
+      <div style={{ background: "#fff", border: "1px solid #E5E7EB", borderRadius: 14, padding: 20 }}>
+        <div style={{ fontSize: 13, fontWeight: 700, color: "#374151", marginBottom: 14 }}>שליחה לנתבע</div>
+        {c.contactEmail ? (
+          <>
+            <div style={{ fontSize: 12, color: "#6B7280", marginBottom: 12, lineHeight: 1.6 }}>
+              <span>שליחת התראה אל: </span>
+              <strong>{c.contactEmail}</strong>
+              {c.uploadedDocument
+                ? <span style={{ color: "#10B981", marginRight: 8 }}> · מסמך מועלה יצורף</span>
+                : <span style={{ color: "#9CA3AF", marginRight: 8 }}> · התראה תיווצר כ-DOCX אוטומטית</span>
+              }
+            </div>
+            {emailStatus === "sent" && (
+              <div style={{
+                background: "#F0FDF4", border: "1px solid #BBF7D0", borderRadius: 8,
+                padding: "10px 14px", marginBottom: 12, color: "#065F46", fontSize: 13,
+              }}>
+                ✓ הטיוטה נוצרה ב-Gmail — שלב התיק עודכן לאחר "התראה נשלחה"
+              </div>
+            )}
+            {emailStatus === "error" && (
+              <div style={{
+                background: "#FEF2F2", border: "1px solid #FCA5A5", borderRadius: 8,
+                padding: "10px 14px", marginBottom: 12, color: "#991B1B", fontSize: 13,
+              }}>
+                שגיאה בשליחה: {emailError}
+              </div>
+            )}
+            <button
+              onClick={handleSendEmail}
+              disabled={sendingEmail}
+              style={{
+                padding: "10px 22px",
+                background: sendingEmail ? "#9CA3AF" : "#7C3AED",
+                color: "#fff", border: "none", borderRadius: 8,
+                fontWeight: 700, fontSize: 14,
+                cursor: sendingEmail ? "not-allowed" : "pointer",
+              }}
+            >
+              {sendingEmail ? "⏳ שולח..." : "✉️ שלח PDF לנתבע"}
+            </button>
+          </>
+        ) : (
+          <div style={{ fontSize: 13, color: "#9CA3AF" }}>אין כתובת אימייל לנתבע בתיק זה.</div>
+        )}
       </div>
     </div>
   );

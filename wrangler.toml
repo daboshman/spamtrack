@@ -1,2 +1,8 @@
 name = "spamtrack"
 pages_build_output_dir = "dist"
+compatibility_date = "2024-09-23"
+
+[vars]
+# Set secrets via: wrangler pages secret put ANTHROPIC_API_KEY
+# Set secrets via: wrangler pages secret put GMAIL_MCP_URL
+# Set secrets via: wrangler pages secret put GMAIL_OAUTH_TOKEN

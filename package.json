@@ -8,7 +8,9 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "@anthropic-ai/sdk": "^0.56.0",
     "@supabase/supabase-js": "^2.49.4",
+    "docx": "^9.5.0",
     "firebase": "^12.12.1",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
@@ -16,6 +18,6 @@
   },
   "devDependencies": {
     "@vitejs/plugin-react": "^4.4.1",
-    "vite": "^6.3.1"
+    "vite": "^6.4.2"
   }
 }
