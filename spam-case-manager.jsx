@@ -227,9 +227,21 @@ ${nextSectionNum + 1}. אשר על כן, מתבקש בית המשפט הנכבד
 
 // ─── DOCX HELPERS ────────────────────────────────────────────────────────────
 
-async function buildDocxBlob(c, type) {
-  const [{ Document, Packer, Paragraph, TextRun, AlignmentType }, JSZip] =
+async function buildDocxBlob(c, type, signature = null) {
+  const [{ Document, Packer, Paragraph, TextRun, AlignmentType, ImageRun }, JSZip] =
     await Promise.all([import("docx"), import("jszip").then(m => m.default)]);
+
+  const toBytes = (dataUrl) => {
+    const b64 = dataUrl.includes(",") ? dataUrl.split(",")[1] : dataUrl;
+    const bin = atob(b64);
+    const out = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+    return out;
+  };
+  const fitImg = (w, h, maxW) => {
+    const s = Math.min(1, maxW / w);
+    return { width: Math.round(w * s), height: Math.round(h * s) };
+  };
 
   const text = type === "warning" ? generateWarningLetter(c) : generateLawsuit(c);
   const lines = text.split("\n");
@@ -266,6 +278,42 @@ async function buildDocxBlob(c, type) {
       children: [mkRun(line, bold)],
     });
   });
+
+  // Signature block (lawsuit only)
+  if (type === "lawsuit" && signature) {
+    const { w: sw, h: sh } = await imgDimensions(signature);
+    const sigFit = fitImg(sw, sh, 180); // realistic signature width ~5 cm
+    children.push(
+      new Paragraph({ bidirectional: true, spacing: { before: 600 }, children: [mkRun("בכבוד רב,", false)] }),
+      new Paragraph({ bidirectional: true, spacing: { before: 80, after: 80 }, children: [] }),
+      new Paragraph({
+        bidirectional: true,
+        alignment: AlignmentType.RIGHT,
+        children: [new ImageRun({ data: toBytes(signature), transformation: sigFit, type: "png" })],
+      }),
+      new Paragraph({ bidirectional: true, children: [mkRun("אשר דיבה, עו״ד", true)] }),
+    );
+  }
+
+  // Evidence appendix (lawsuit only)
+  if (type === "lawsuit" && c.evidence?.length > 0) {
+    children.push(
+      new Paragraph({ bidirectional: true, pageBreakBefore: true, children: [mkRun("נספחים – ראיות", true)] }),
+    );
+    for (let i = 0; i < c.evidence.length; i++) {
+      const ev = c.evidence[i];
+      const { w: ew, h: eh } = await imgDimensions(ev.data);
+      const evFit = fitImg(ew, eh, 460);
+      children.push(
+        new Paragraph({ bidirectional: true, spacing: { before: 300, after: 100 }, children: [mkRun(`ראיה ${i + 1}`, false)] }),
+        new Paragraph({
+          alignment: AlignmentType.CENTER,
+          spacing: { after: 400 },
+          children: [new ImageRun({ data: toBytes(ev.data), transformation: evFit, type: "jpg" })],
+        }),
+      );
+    }
+  }
 
   const doc = new Document({
     styles: {
@@ -337,9 +385,37 @@ function blobToBase64(blob) {
   });
 }
 
+// Resize image to max 700px wide and compress as JPEG to keep Firestore docs small.
+function compressImage(file) {
+  return new Promise((resolve) => {
+    const img = new Image();
+    const url = URL.createObjectURL(file);
+    img.onload = () => {
+      const MAX = 700;
+      const scale = Math.min(1, MAX / img.width);
+      const canvas = document.createElement("canvas");
+      canvas.width = Math.round(img.width * scale);
+      canvas.height = Math.round(img.height * scale);
+      canvas.getContext("2d").drawImage(img, 0, 0, canvas.width, canvas.height);
+      URL.revokeObjectURL(url);
+      resolve(canvas.toDataURL("image/jpeg", 0.72));
+    };
+    img.src = url;
+  });
+}
+
+// Returns { w, h } of an image given its data URL.
+function imgDimensions(dataUrl) {
+  return new Promise((res) => {
+    const img = new Image();
+    img.onload = () => res({ w: img.width, h: img.height });
+    img.src = dataUrl;
+  });
+}
+
 // Generate a PDF blob directly from case text using browser canvas rendering.
 // The browser handles Hebrew RTL natively — no external service needed.
-async function buildPdfBlob(c, type) {
+async function buildPdfBlob(c, type, signature = null) {
   const { jsPDF } = await import("jspdf");
   const text = type === "warning" ? generateWarningLetter(c) : generateLawsuit(c);
   const lines = text.split("\n");
@@ -389,6 +465,43 @@ async function buildPdfBlob(c, type) {
     doc.addImage(canvas.toDataURL("image/png"), "PNG", MARGIN, MARGIN, CONTENT_W, CONTENT_H);
   }
 
+  // Signature page (lawsuit only)
+  if (type === "lawsuit" && signature) {
+    doc.addPage();
+    // Render "בכבוד רב," and lawyer name as text using the same canvas
+    const sigTextLines = ["בכבוד רב,", "", "אשר דיבה, עו״ד"];
+    canvas.height = Math.round(sigTextLines.length * LINE_H * MM2PX);
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    sigTextLines.forEach((line, i) => {
+      ctx.font = `${(i === 2 ? "bold " : "")}${11 * MM2PX * 0.352}px Arial`;
+      ctx.direction = "rtl"; ctx.textAlign = "right";
+      ctx.fillText(line, canvas.width, (i + 0.75) * LINE_H * MM2PX);
+    });
+    const textH = sigTextLines.length * LINE_H;
+    doc.addImage(canvas.toDataURL("image/png"), "PNG", MARGIN, MARGIN, CONTENT_W, textH);
+
+    // Signature image: ~60mm wide, proportional height
+    const sigDims = await imgDimensions(signature);
+    const sigW = 60;
+    const sigH = sigW * sigDims.h / sigDims.w;
+    doc.addImage(signature, "PNG", MARGIN, MARGIN + textH + 2, sigW, sigH);
+  }
+
+  // Evidence pages (lawsuit only)
+  if (type === "lawsuit" && c.evidence?.length > 0) {
+    for (const ev of c.evidence) {
+      doc.addPage();
+      const dims = await imgDimensions(ev.data);
+      const maxW = CONTENT_W;
+      const maxH = CONTENT_H - 10;
+      const scale = Math.min(maxW / dims.w, maxH / dims.h);
+      const evW = dims.w * scale;
+      const evH = dims.h * scale;
+      const xOff = MARGIN + (maxW - evW) / 2; // center horizontally
+      doc.addImage(ev.data, "JPEG", xOff, MARGIN + 10, evW, evH);
+    }
+  }
+
   return doc.output("blob");
 }
 
@@ -432,6 +545,79 @@ function buildMimeMessage({ to, subject, bodyText, attachments = [] }) {
 }
 
 // ─── COMPONENTS ──────────────────────────────────────────────────────────────
+
+function SignaturePad({ onSave, onCancel }) {
+  const canvasRef = useRef(null);
+  const drawing = useRef(false);
+  const last = useRef(null);
+
+  const pos = (e) => {
+    const r = canvasRef.current.getBoundingClientRect();
+    const src = e.touches?.[0] ?? e;
+    const cvs = canvasRef.current;
+    return {
+      x: (src.clientX - r.left) * (cvs.width / r.width),
+      y: (src.clientY - r.top) * (cvs.height / r.height),
+    };
+  };
+
+  const start = (e) => { e.preventDefault(); drawing.current = true; last.current = pos(e); };
+
+  const move = (e) => {
+    e.preventDefault();
+    if (!drawing.current) return;
+    const ctx = canvasRef.current.getContext("2d");
+    const p = pos(e);
+    ctx.beginPath();
+    ctx.moveTo(last.current.x, last.current.y);
+    ctx.lineTo(p.x, p.y);
+    ctx.strokeStyle = "#111"; ctx.lineWidth = 2.5;
+    ctx.lineCap = "round"; ctx.lineJoin = "round";
+    ctx.stroke();
+    last.current = p;
+  };
+
+  const stop = () => { drawing.current = false; };
+
+  const clear = () => {
+    const cvs = canvasRef.current;
+    cvs.getContext("2d").clearRect(0, 0, cvs.width, cvs.height);
+  };
+
+  const save = () => onSave(canvasRef.current.toDataURL("image/png"));
+
+  return (
+    <div style={{ direction: "rtl" }}>
+      <div style={{ fontSize: 12, color: "#6B7280", marginBottom: 8 }}>חתמו בתיבה (עכבר או מגע)</div>
+      <canvas
+        ref={canvasRef} width={480} height={150}
+        style={{ border: "1.5px solid #D1D5DB", borderRadius: 8, cursor: "crosshair",
+          touchAction: "none", background: "#FAFAFA", width: "100%", display: "block" }}
+        onMouseDown={start} onMouseMove={move} onMouseUp={stop} onMouseLeave={stop}
+        onTouchStart={start} onTouchMove={move} onTouchEnd={stop}
+      />
+      <div style={{ marginTop: 8, display: "flex", gap: 8, justifyContent: "flex-start" }}>
+        <button onClick={save}
+          style={{ padding: "7px 18px", background: "#7C3AED", color: "#fff",
+            border: "none", borderRadius: 7, fontWeight: 700, fontSize: 13, cursor: "pointer" }}>
+          שמור חתימה
+        </button>
+        <button onClick={clear}
+          style={{ padding: "7px 14px", background: "#F3F4F6", color: "#374151",
+            border: "1px solid #D1D5DB", borderRadius: 7, fontSize: 13, cursor: "pointer" }}>
+          נקה
+        </button>
+        {onCancel && (
+          <button onClick={onCancel}
+            style={{ padding: "7px 14px", background: "none", color: "#9CA3AF",
+              border: "none", fontSize: 13, cursor: "pointer" }}>
+            ביטול
+          </button>
+        )}
+      </div>
+    </div>
+  );
+}
 
 function Badge({ stage }) {
   const s = STAGES.find(x => x.id === stage) || STAGES[0];
@@ -673,7 +859,7 @@ function NewCaseModal({ onSave, onClose }) {
   );
 }
 
-function CaseDetail({ c, onUpdate, onBack, gmailToken, onGmailToken }) {
+function CaseDetail({ c, onUpdate, onBack, gmailToken, onGmailToken, signature, onSignature }) {
   const [showTemplate, setShowTemplate] = useState(null);
   const [addingNote, setAddingNote] = useState(false);
   const [noteText, setNoteText] = useState("");
@@ -683,12 +869,30 @@ function CaseDetail({ c, onUpdate, onBack, gmailToken, onGmailToken }) {
   const [sendingEmail, setSendingEmail] = useState(false);
   const [emailStatus, setEmailStatus] = useState(null);
   const [emailError, setEmailError] = useState(null);
+  const [showSigPad, setShowSigPad] = useState(false);
   const fileInputRef = useRef(null);
+  const evidenceInputRef = useRef(null);
+
+  const handleEvidenceUpload = async (e) => {
+    const files = Array.from(e.target.files);
+    if (!files.length) return;
+    const compressed = await Promise.all(files.map(compressImage));
+    const newItems = compressed.map((data, i) => ({
+      id: `${Date.now()}_${i}`,
+      name: files[i].name,
+      data,
+    }));
+    onUpdate({ ...c, evidence: [...(c.evidence ?? []), ...newItems] });
+    e.target.value = "";
+  };
+
+  const handleDeleteEvidence = (id) =>
+    onUpdate({ ...c, evidence: (c.evidence ?? []).filter(ev => ev.id !== id) });
 
   const handleDownloadDocx = async (type) => {
     setDocxLoading(type);
     try {
-      const blob = await buildDocxBlob(c, type);
+      const blob = await buildDocxBlob(c, type, signature);
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
       a.href = url;
@@ -751,8 +955,8 @@ function CaseDetail({ c, onUpdate, onBack, gmailToken, onGmailToken }) {
     try {
       // Generate both PDFs in parallel directly in the browser
       const [warningPdfB64, lawsuitPdfB64] = await Promise.all([
-        buildPdfBlob(c, "warning").then(blobToBase64),
-        buildPdfBlob(c, "lawsuit").then(blobToBase64),
+        buildPdfBlob(c, "warning", signature).then(blobToBase64),
+        buildPdfBlob(c, "lawsuit", signature).then(blobToBase64),
       ]);
 
       const subject = `התראה בטרם נקיטת הליכים — תיק #${c.caseNumber}`;
@@ -909,6 +1113,65 @@ function CaseDetail({ c, onUpdate, onBack, gmailToken, onGmailToken }) {
             }}>✓ {a.label}</button>
           ))}
         </div>
+      </div>
+
+      {/* Evidence screenshots */}
+      <div style={{ background: "#fff", border: "1px solid #E5E7EB", borderRadius: 14, padding: 20, marginBottom: 16 }}>
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 14 }}>
+          <div style={{ fontSize: 13, fontWeight: 700, color: "#374151" }}>ראיות – צילומי מסך</div>
+          <button
+            onClick={() => evidenceInputRef.current.click()}
+            style={{ padding: "6px 14px", background: "#F9FAFB", color: "#374151",
+              border: "1px solid #D1D5DB", borderRadius: 7, fontSize: 12, cursor: "pointer", fontWeight: 600 }}>
+            + הוסף צילומי מסך
+          </button>
+        </div>
+        <input ref={evidenceInputRef} type="file" accept="image/*" multiple style={{ display: "none" }} onChange={handleEvidenceUpload} />
+        {(c.evidence ?? []).length === 0 ? (
+          <div style={{ fontSize: 12, color: "#9CA3AF" }}>לא הועלו ראיות עדיין. צילומי המסך יצורפו לכתב התביעה.</div>
+        ) : (
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(110px, 1fr))", gap: 10 }}>
+            {(c.evidence ?? []).map(ev => (
+              <div key={ev.id} style={{ position: "relative", borderRadius: 8, overflow: "hidden",
+                border: "1px solid #E5E7EB", background: "#F9FAFB" }}>
+                <img src={ev.data} alt={ev.name}
+                  style={{ width: "100%", aspectRatio: "3/4", objectFit: "cover", display: "block" }} />
+                <button
+                  onClick={() => handleDeleteEvidence(ev.id)}
+                  style={{ position: "absolute", top: 4, left: 4, background: "rgba(0,0,0,0.55)",
+                    color: "#fff", border: "none", borderRadius: "50%", width: 22, height: 22,
+                    cursor: "pointer", fontSize: 13, lineHeight: "22px", textAlign: "center", padding: 0 }}>
+                  ×
+                </button>
+                <div style={{ padding: "4px 6px", fontSize: 10, color: "#6B7280",
+                  overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                  {ev.name}
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+
+      {/* Signature */}
+      <div style={{ background: "#fff", border: "1px solid #E5E7EB", borderRadius: 14, padding: 20, marginBottom: 16 }}>
+        <div style={{ fontSize: 13, fontWeight: 700, color: "#374151", marginBottom: 12 }}>חתימה (לכתב התביעה)</div>
+        {signature && !showSigPad ? (
+          <div>
+            <img src={signature} alt="חתימה"
+              style={{ maxWidth: 220, height: "auto", border: "1px solid #E5E7EB", borderRadius: 8, display: "block", marginBottom: 10 }} />
+            <button onClick={() => setShowSigPad(true)}
+              style={{ padding: "6px 14px", background: "#F9FAFB", color: "#374151",
+                border: "1px solid #D1D5DB", borderRadius: 7, fontSize: 12, cursor: "pointer" }}>
+              שנה חתימה
+            </button>
+          </div>
+        ) : (
+          <SignaturePad
+            onSave={(dataUrl) => { onSignature(dataUrl); setShowSigPad(false); }}
+            onCancel={signature ? () => setShowSigPad(false) : null}
+          />
+        )}
       </div>
 
       {/* Documents */}
@@ -1092,6 +1355,12 @@ export default function App() {
   const [authLoading, setAuthLoading] = useState(true);
   const [loaded, setLoaded] = useState(false);
   const [gmailToken, setGmailToken] = useState(null);
+  const [signature, setSignature] = useState(() => localStorage.getItem("spamtrack_sig") ?? null);
+
+  const handleSignature = (dataUrl) => {
+    setSignature(dataUrl);
+    localStorage.setItem("spamtrack_sig", dataUrl);
+  };
 
   useEffect(() => {
     return onAuthStateChanged(auth, (u) => {
@@ -1188,6 +1457,8 @@ export default function App() {
           onBack={() => setSelectedCase(null)}
           gmailToken={gmailToken}
           onGmailToken={setGmailToken}
+          signature={signature}
+          onSignature={handleSignature}
         />
       </div>
     );
