@@ -901,6 +901,7 @@ export default function App() {
   const [search, setSearch] = useState("");
   const [user, setUser] = useState(null);
   const [authLoading, setAuthLoading] = useState(true);
+  const [loaded, setLoaded] = useState(false);
 
   useEffect(() => {
     return onAuthStateChanged(auth, (u) => {
@@ -924,17 +925,19 @@ export default function App() {
         const snap = await getDoc(doc(db, "spamtrack", "asher", "data", "cases"));
         if (snap.exists()) setCases(snap.data().list);
       } catch (e) { console.error(e); }
+      setLoaded(true);
     })();
   }, []);
 
   // Save to storage
   useEffect(() => {
+    if (!loaded) return;
     (async () => {
       try {
         await setDoc(doc(db, "spamtrack", "asher", "data", "cases"), { list: cases });
       } catch (e) { console.error(e); }
     })();
-  }, [cases]);
+  }, [cases, loaded]);
 
   const updateCase = (updated) => {
     setCases(cs => cs.map(c => c.id === updated.id ? updated : c));
