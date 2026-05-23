@@ -259,7 +259,35 @@ async function buildDocxBlob(c, type, signature = null) {
       language: { bidirectional: "he-IL" },
     });
 
-  const children = lines.map((line, idx) => {
+  // Pre-compute signature dimensions once (used when we hit the [חתימה] placeholder)
+  const sigDimsDocx = (type === "lawsuit" && signature) ? await imgDimensions(signature) : null;
+
+  const children = [];
+  for (let idx = 0; idx < lines.length; idx++) {
+    const line = lines[idx];
+
+    // Replace the [חתימה] placeholder with the actual signature image
+    if (line === "[חתימה]" && type === "lawsuit") {
+      if (signature && sigDimsDocx) {
+        const sigFit = fitImg(sigDimsDocx.w, sigDimsDocx.h, 180);
+        children.push(new Paragraph({
+          bidirectional: true,
+          alignment: AlignmentType.RIGHT,
+          spacing: { before: 40, after: 40 },
+          children: [new ImageRun({ data: toBytes(signature), transformation: sigFit, type: "png" })],
+        }));
+      } else {
+        // No signature yet — render a blank underline so the spot is visible
+        children.push(new Paragraph({
+          bidirectional: true,
+          alignment: AlignmentType.START,
+          spacing: { after: 40 },
+          children: [mkRun("_________________", false)],
+        }));
+      }
+      continue;
+    }
+
     const isSenderHeader = type === "warning" && idx <= 5;
     const isDocTitle =
       line === "כתב תביעה" ||
@@ -271,28 +299,12 @@ async function buildDocxBlob(c, type, signature = null) {
     const isCentered = line === "כתב תביעה" || line === "- נ ג ד -" || line === "בכפר סבא";
     const bold = isSenderHeader || isDocTitle || isSectionHeader;
 
-    return new Paragraph({
+    children.push(new Paragraph({
       bidirectional: true,
       alignment: isCentered ? AlignmentType.CENTER : AlignmentType.START,
       spacing: line.trim() === "" ? { after: 120 } : { after: 40 },
       children: [mkRun(line, bold)],
-    });
-  });
-
-  // Signature block (lawsuit only)
-  if (type === "lawsuit" && signature) {
-    const { w: sw, h: sh } = await imgDimensions(signature);
-    const sigFit = fitImg(sw, sh, 180); // realistic signature width ~5 cm
-    children.push(
-      new Paragraph({ bidirectional: true, spacing: { before: 600 }, children: [mkRun("בכבוד רב,", false)] }),
-      new Paragraph({ bidirectional: true, spacing: { before: 80, after: 80 }, children: [] }),
-      new Paragraph({
-        bidirectional: true,
-        alignment: AlignmentType.RIGHT,
-        children: [new ImageRun({ data: toBytes(signature), transformation: sigFit, type: "png" })],
-      }),
-      new Paragraph({ bidirectional: true, children: [mkRun("אשר דיבה, עו״ד", true)] }),
-    );
+    }));
   }
 
   // Evidence appendix (lawsuit only)
@@ -436,10 +448,17 @@ async function buildPdfBlob(c, type, signature = null) {
 
   const doc = new jsPDF({ unit: "mm", format: "a4" });
 
+  // Find where [חתימה] sits so we can overlay the image after rendering that page
+  const sigLineIdx = (type === "lawsuit" && signature) ? lines.indexOf("[חתימה]") : -1;
+  const sigDimsPdf = sigLineIdx >= 0 ? await imgDimensions(signature) : null;
+
+  // Replace [חתימה] with empty string — its row is reserved for the image overlay
+  const renderLines = lines.map(l => (l === "[חתימה]" ? "" : l));
+
   // Chunk lines into pages
-  for (let page = 0; page * LINES_PER_PAGE < lines.length; page++) {
+  for (let page = 0; page * LINES_PER_PAGE < renderLines.length; page++) {
     if (page > 0) doc.addPage();
-    const pageLines = lines.slice(page * LINES_PER_PAGE, (page + 1) * LINES_PER_PAGE);
+    const pageLines = renderLines.slice(page * LINES_PER_PAGE, (page + 1) * LINES_PER_PAGE);
 
     ctx.clearRect(0, 0, canvas.width, canvas.height);
 
@@ -453,7 +472,7 @@ async function buildPdfBlob(c, type, signature = null) {
         /^(התובע|הנתבעת|בית משפט לתביעות קטנות)/.test(line);
       const isCentered = line === "כתב תביעה" || line === "- נ ג ד -" || line === "בכפר סבא";
 
-      const fontPx = (isBold ? 13 : 11) * MM2PX * 0.352; // pt → mm → px
+      const fontPx = (isBold ? 13 : 11) * MM2PX * 0.352;
       ctx.font = `${isBold ? "bold " : ""}${fontPx}px Arial`;
       ctx.direction = "rtl";
       ctx.textAlign = isCentered ? "center" : "right";
@@ -463,28 +482,15 @@ async function buildPdfBlob(c, type, signature = null) {
     });
 
     doc.addImage(canvas.toDataURL("image/png"), "PNG", MARGIN, MARGIN, CONTENT_W, CONTENT_H);
-  }
 
-  // Signature page (lawsuit only)
-  if (type === "lawsuit" && signature) {
-    doc.addPage();
-    // Render "בכבוד רב," and lawyer name as text using the same canvas
-    const sigTextLines = ["בכבוד רב,", "", "אשר דיבה, עו״ד"];
-    canvas.height = Math.round(sigTextLines.length * LINE_H * MM2PX);
-    ctx.clearRect(0, 0, canvas.width, canvas.height);
-    sigTextLines.forEach((line, i) => {
-      ctx.font = `${(i === 2 ? "bold " : "")}${11 * MM2PX * 0.352}px Arial`;
-      ctx.direction = "rtl"; ctx.textAlign = "right";
-      ctx.fillText(line, canvas.width, (i + 0.75) * LINE_H * MM2PX);
-    });
-    const textH = sigTextLines.length * LINE_H;
-    doc.addImage(canvas.toDataURL("image/png"), "PNG", MARGIN, MARGIN, CONTENT_W, textH);
-
-    // Signature image: ~60mm wide, proportional height
-    const sigDims = await imgDimensions(signature);
-    const sigW = 60;
-    const sigH = sigW * sigDims.h / sigDims.w;
-    doc.addImage(signature, "PNG", MARGIN, MARGIN + textH + 2, sigW, sigH);
+    // Overlay signature image at the exact row where [חתימה] was
+    if (sigLineIdx >= 0 && Math.floor(sigLineIdx / LINES_PER_PAGE) === page) {
+      const rowInPage = sigLineIdx % LINES_PER_PAGE;
+      const sigY = MARGIN + rowInPage * LINE_H;
+      const sigW = 55; // ~55 mm ≈ realistic signature width
+      const sigH = sigW * sigDimsPdf.h / sigDimsPdf.w;
+      doc.addImage(signature, "PNG", MARGIN, sigY, sigW, sigH);
+    }
   }
 
   // Evidence pages (lawsuit only)
