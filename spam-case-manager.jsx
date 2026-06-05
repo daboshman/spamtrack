@@ -1372,6 +1372,7 @@ export default function App() {
   const [filterStage, setFilterStage] = useState("all");
   const [search, setSearch] = useState("");
   const [user, setUser] = useState(null);
+  const [pendingUser, setPendingUser] = useState(null);
   const [authPhase, setAuthPhase] = useState("loading");
   const [authEmail, setAuthEmail] = useState("");
   const [authPassword, setAuthPassword] = useState("");
@@ -1396,21 +1397,22 @@ export default function App() {
         if (freshPageLoad.current) {
           freshPageLoad.current = false;
           await signOut(auth);
-        } else {
-          setUser(u);
         }
+        // Don't setUser here — auth handlers set it only after TOTP verification
       } else {
         freshPageLoad.current = false;
         setUser(null);
+        setPendingUser(null);
         setAuthPhase("login");
       }
     });
   }, []);
 
   const checkEnrollment = async (u) => {
-    setUser(u);
+    setPendingUser(u);
     const hasTotpEnrolled = u.multiFactor.enrolledFactors.some(f => f.factorId === "totp");
     if (hasTotpEnrolled) {
+      setUser(u);
       setAuthPhase("app");
     } else {
       try {
@@ -1421,7 +1423,7 @@ export default function App() {
         setAuthPhase("mfa-enroll");
       } catch (err) {
         console.error(err);
-        setAuthError("שגיאה בהגדרת אימות דו-שלבי");
+        setAuthError("TOTP אינו מופעל בפרויקט Firebase — הפעל אותו ונסה שוב");
       }
     }
   };
@@ -1483,12 +1485,13 @@ export default function App() {
   };
 
   const handleMfaEnroll = async () => {
-    if (!authOtp || !totpEnroll) return;
+    if (!authOtp || !totpEnroll || !pendingUser) return;
     setAuthBusy(true);
     setAuthError(null);
     try {
       const assertion = TotpMultiFactorGenerator.assertionForEnrollment(totpEnroll.secret, authOtp.trim());
-      await multiFactor(user).enroll(assertion, "Google Authenticator");
+      await multiFactor(pendingUser).enroll(assertion, "Google Authenticator");
+      setUser(pendingUser);
       setAuthPhase("app");
       setAuthOtp("");
     } catch {
@@ -1500,6 +1503,7 @@ export default function App() {
 
   const handleLogout = async () => {
     setLoaded(false);
+    setPendingUser(null);
     setAuthEmail("");
     setAuthPassword("");
     setAuthOtp("");
