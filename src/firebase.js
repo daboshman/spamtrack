@@ -4,7 +4,7 @@ import { getAuth, setPersistence, browserLocalPersistence, browserSessionPersist
 
 const firebaseConfig = {
   apiKey: "AIzaSyDFsPmjzff1JBCph_SMTHmcMmGIzc5KKzI",
-  authDomain: "spam-track.web.app",
+  authDomain: "spam-track.firebaseapp.com",
   projectId: "spam-track",
   storageBucket: "spam-track.firebasestorage.app",
   messagingSenderId: "87123540306",
