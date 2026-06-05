@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef } from "react";
 import { db, auth } from "./src/firebase";
 import { doc, getDoc, setDoc } from "firebase/firestore";
-import { GoogleAuthProvider, signInWithPopup, signOut, onAuthStateChanged } from "firebase/auth";
+import { GoogleAuthProvider, signInWithPopup, signOut, onAuthStateChanged, signInWithEmailAndPassword, TotpMultiFactorGenerator, getMultiFactorResolver, multiFactor } from "firebase/auth";
 
 // ─── DATA ────────────────────────────────────────────────────────────────────
 
@@ -1352,6 +1352,19 @@ function CaseDetail({ c, onUpdate, onBack, gmailToken, onGmailToken, signature, 
 
 // ─── MAIN APP ─────────────────────────────────────────────────────────────────
 
+function translateError(code) {
+  const m = {
+    "auth/wrong-password": "סיסמה שגויה",
+    "auth/invalid-credential": "פרטים שגויים",
+    "auth/user-not-found": "משתמש לא קיים",
+    "auth/invalid-email": "כתובת אימייל לא תקינה",
+    "auth/too-many-requests": "יותר מדי ניסיונות, נסה מאוחר יותר",
+    "auth/network-request-failed": "שגיאת רשת",
+    "auth/user-disabled": "חשבון זה הושבת",
+  };
+  return m[code] ?? "שגיאת כניסה, נסה שוב";
+}
+
 export default function App() {
   const [cases, setCases] = useState(SAMPLE_CASES);
   const [selectedCase, setSelectedCase] = useState(null);
@@ -1359,7 +1372,15 @@ export default function App() {
   const [filterStage, setFilterStage] = useState("all");
   const [search, setSearch] = useState("");
   const [user, setUser] = useState(null);
-  const [authLoading, setAuthLoading] = useState(true);
+  const [authPhase, setAuthPhase] = useState("loading");
+  const [authEmail, setAuthEmail] = useState("");
+  const [authPassword, setAuthPassword] = useState("");
+  const [authOtp, setAuthOtp] = useState("");
+  const [authError, setAuthError] = useState(null);
+  const [authBusy, setAuthBusy] = useState(false);
+  const [mfaResolver, setMfaResolver] = useState(null);
+  const [totpEnroll, setTotpEnroll] = useState(null);
+  const freshPageLoad = useRef(true);
   const [loaded, setLoaded] = useState(false);
   const [gmailToken, setGmailToken] = useState(null);
   const [signature, setSignature] = useState(() => localStorage.getItem("spamtrack_sig") ?? null);
@@ -1370,22 +1391,127 @@ export default function App() {
   };
 
   useEffect(() => {
-    return onAuthStateChanged(auth, (u) => {
-      setUser(u);
-      setAuthLoading(false);
+    return onAuthStateChanged(auth, async (u) => {
+      if (u) {
+        if (freshPageLoad.current) {
+          freshPageLoad.current = false;
+          await signOut(auth);
+        } else {
+          setUser(u);
+        }
+      } else {
+        freshPageLoad.current = false;
+        setUser(null);
+        setAuthPhase("login");
+      }
     });
   }, []);
 
-  const handleLogin = async () => {
-    const provider = new GoogleAuthProvider();
-    provider.setCustomParameters({ login_hint: "asherdiba@gmail.com" });
-    await signInWithPopup(auth, provider);
+  const checkEnrollment = async (u) => {
+    setUser(u);
+    const hasTotpEnrolled = u.multiFactor.enrolledFactors.some(f => f.factorId === "totp");
+    if (hasTotpEnrolled) {
+      setAuthPhase("app");
+    } else {
+      try {
+        const session = await u.multiFactor.getSession();
+        const secret = await TotpMultiFactorGenerator.generateSecret(session);
+        const uri = secret.generateQrCodeUrl(u.email, "SpamTrack");
+        setTotpEnroll({ secret, uri });
+        setAuthPhase("mfa-enroll");
+      } catch (err) {
+        console.error(err);
+        setAuthError("שגיאה בהגדרת אימות דו-שלבי");
+      }
+    }
   };
 
-  const handleLogout = () => signOut(auth);
+  const handleGoogleLogin = async () => {
+    setAuthBusy(true);
+    setAuthError(null);
+    try {
+      const provider = new GoogleAuthProvider();
+      const result = await signInWithPopup(auth, provider);
+      await checkEnrollment(result.user);
+    } catch (err) {
+      if (err.code === "auth/multi-factor-auth-required") {
+        setMfaResolver(getMultiFactorResolver(auth, err));
+        setAuthPhase("mfa-challenge");
+      } else if (err.code !== "auth/popup-closed-by-user" && err.code !== "auth/cancelled-popup-request") {
+        setAuthError(translateError(err.code));
+      }
+    } finally {
+      setAuthBusy(false);
+    }
+  };
+
+  const handleEmailLogin = async () => {
+    if (!authEmail || !authPassword) return;
+    setAuthBusy(true);
+    setAuthError(null);
+    try {
+      const result = await signInWithEmailAndPassword(auth, authEmail, authPassword);
+      await checkEnrollment(result.user);
+    } catch (err) {
+      if (err.code === "auth/multi-factor-auth-required") {
+        setMfaResolver(getMultiFactorResolver(auth, err));
+        setAuthPhase("mfa-challenge");
+      } else {
+        setAuthError(translateError(err.code));
+      }
+    } finally {
+      setAuthBusy(false);
+    }
+  };
+
+  const handleMfaChallenge = async () => {
+    if (!authOtp) return;
+    setAuthBusy(true);
+    setAuthError(null);
+    try {
+      const hint = mfaResolver.hints.find(h => h.factorId === TotpMultiFactorGenerator.FACTOR_ID);
+      const assertion = TotpMultiFactorGenerator.assertionForSignIn(hint.uid, authOtp.trim());
+      const result = await mfaResolver.resolveSignIn(assertion);
+      setUser(result.user);
+      setAuthPhase("app");
+      setAuthOtp("");
+    } catch {
+      setAuthError("קוד שגוי, נסה שוב");
+    } finally {
+      setAuthBusy(false);
+    }
+  };
+
+  const handleMfaEnroll = async () => {
+    if (!authOtp || !totpEnroll) return;
+    setAuthBusy(true);
+    setAuthError(null);
+    try {
+      const assertion = TotpMultiFactorGenerator.assertionForEnrollment(totpEnroll.secret, authOtp.trim());
+      await multiFactor(user).enroll(assertion, "Google Authenticator");
+      setAuthPhase("app");
+      setAuthOtp("");
+    } catch {
+      setAuthError("קוד שגוי, נסה שוב");
+    } finally {
+      setAuthBusy(false);
+    }
+  };
+
+  const handleLogout = async () => {
+    setLoaded(false);
+    setAuthEmail("");
+    setAuthPassword("");
+    setAuthOtp("");
+    setAuthError(null);
+    setMfaResolver(null);
+    setTotpEnroll(null);
+    await signOut(auth);
+  };
 
   // Load from storage
   useEffect(() => {
+    if (!user) return;
     (async () => {
       try {
         const snap = await getDoc(doc(db, "spamtrack", "asher", "data", "cases"));
@@ -1393,17 +1519,17 @@ export default function App() {
       } catch (e) { console.error(e); }
       setLoaded(true);
     })();
-  }, []);
+  }, [user]);
 
   // Save to storage
   useEffect(() => {
-    if (!loaded) return;
+    if (!loaded || !user) return;
     (async () => {
       try {
         await setDoc(doc(db, "spamtrack", "asher", "data", "cases"), { list: cases });
       } catch (e) { console.error(e); }
     })();
-  }, [cases, loaded]);
+  }, [cases, loaded, user]);
 
   const updateCase = (updated) => {
     setCases(cs => cs.map(c => c.id === updated.id ? updated : c));
@@ -1429,20 +1555,115 @@ export default function App() {
     settled: cases.filter(c => c.stage === "settled").length,
   };
 
-  if (authLoading) return (
+  if (authPhase === "loading") return (
     <div style={{ display:"flex", alignItems:"center", justifyContent:"center", minHeight:"100vh", fontFamily:"'Heebo', sans-serif" }}>
       טוען...
     </div>
   );
 
-  if (!user) return (
-    <div style={{ display:"flex", alignItems:"center", justifyContent:"center", minHeight:"100vh", background:"#F9FAFB", fontFamily:"'Heebo', sans-serif" }}>
-      <div style={{ background:"#fff", borderRadius:16, padding:40, textAlign:"center", border:"1px solid #E5E7EB", maxWidth:360 }}>
-        <div style={{ fontSize:32, marginBottom:8 }}>⚖️</div>
-        <div style={{ fontSize:22, fontWeight:800, color:"#7C3AED", marginBottom:4 }}>SpamTrack</div>
-        <div style={{ fontSize:13, color:"#9CA3AF", marginBottom:24 }}>מערכת ניהול תביעות ספאם</div>
-        <button onClick={handleLogin} style={{ width:"100%", padding:"12px 0", background:"#7C3AED", color:"#fff", border:"none", borderRadius:10, fontWeight:700, fontSize:15, cursor:"pointer" }}>
-          התחבר עם Google
+  if (authPhase === "login") return (
+    <div style={{ display:"flex", alignItems:"center", justifyContent:"center", minHeight:"100vh", background:"#F9FAFB", fontFamily:"'Heebo', sans-serif", direction:"rtl" }}>
+      <div style={{ background:"#fff", borderRadius:16, padding:40, border:"1px solid #E5E7EB", maxWidth:380, width:"100%" }}>
+        <div style={{ textAlign:"center", marginBottom:28 }}>
+          <div style={{ fontSize:36, marginBottom:8 }}>⚖️</div>
+          <div style={{ fontSize:24, fontWeight:800, color:"#7C3AED", marginBottom:4 }}>SpamTrack</div>
+          <div style={{ fontSize:13, color:"#9CA3AF" }}>מערכת ניהול תביעות ספאם</div>
+        </div>
+        {authError && (
+          <div style={{ background:"#FEF2F2", border:"1px solid #FCA5A5", borderRadius:8, padding:"10px 14px", marginBottom:16, fontSize:13, color:"#B91C1C" }}>
+            {authError}
+          </div>
+        )}
+        <button onClick={handleGoogleLogin} disabled={authBusy} style={{ width:"100%", padding:"12px 0", background:"#fff", color:"#374151", border:"1px solid #D1D5DB", borderRadius:10, fontWeight:700, fontSize:14, cursor:authBusy?"not-allowed":"pointer", marginBottom:20, display:"flex", alignItems:"center", justifyContent:"center", gap:10 }}>
+          <svg width="18" height="18" viewBox="0 0 48 48"><path fill="#4285F4" d="M44.5 20H24v8.5h11.8C34.4 33.1 29.7 36 24 36c-6.6 0-12-5.4-12-12s5.4-12 12-12c3.1 0 5.9 1.1 8.1 2.9l6-6C34.6 6.3 29.6 4 24 4 12.9 4 4 12.9 4 24s8.9 20 20 20c11 0 19.7-8 19.7-20 0-1.3-.1-2.7-.2-4z"/></svg>
+          {authBusy ? "מתחבר..." : "כניסה עם Google"}
+        </button>
+        <div style={{ display:"flex", alignItems:"center", gap:12, marginBottom:20 }}>
+          <div style={{ flex:1, height:1, background:"#E5E7EB" }} />
+          <div style={{ fontSize:12, color:"#9CA3AF" }}>או</div>
+          <div style={{ flex:1, height:1, background:"#E5E7EB" }} />
+        </div>
+        <input
+          type="email" placeholder="אימייל" value={authEmail}
+          onChange={e => setAuthEmail(e.target.value)}
+          style={{ width:"100%", padding:"11px 14px", border:"1px solid #D1D5DB", borderRadius:8, fontSize:14, marginBottom:10, boxSizing:"border-box", textAlign:"right" }}
+        />
+        <input
+          type="password" placeholder="סיסמה" value={authPassword}
+          onChange={e => setAuthPassword(e.target.value)}
+          onKeyDown={e => e.key === "Enter" && handleEmailLogin()}
+          style={{ width:"100%", padding:"11px 14px", border:"1px solid #D1D5DB", borderRadius:8, fontSize:14, marginBottom:16, boxSizing:"border-box", textAlign:"right" }}
+        />
+        <button onClick={handleEmailLogin} disabled={authBusy || !authEmail || !authPassword} style={{ width:"100%", padding:"12px 0", background:"#7C3AED", color:"#fff", border:"none", borderRadius:10, fontWeight:700, fontSize:15, cursor:(!authEmail||!authPassword||authBusy)?"not-allowed":"pointer", opacity:(!authEmail||!authPassword)?0.5:1 }}>
+          כניסה
+        </button>
+      </div>
+    </div>
+  );
+
+  if (authPhase === "mfa-challenge") return (
+    <div style={{ display:"flex", alignItems:"center", justifyContent:"center", minHeight:"100vh", background:"#F9FAFB", fontFamily:"'Heebo', sans-serif", direction:"rtl" }}>
+      <div style={{ background:"#fff", borderRadius:16, padding:40, border:"1px solid #E5E7EB", maxWidth:380, width:"100%" }}>
+        <div style={{ textAlign:"center", marginBottom:24 }}>
+          <div style={{ fontSize:36, marginBottom:8 }}>🔐</div>
+          <div style={{ fontSize:20, fontWeight:800, color:"#7C3AED", marginBottom:4 }}>אימות דו-שלבי</div>
+          <div style={{ fontSize:13, color:"#9CA3AF" }}>פתח את Google Authenticator והזן את הקוד</div>
+        </div>
+        {authError && (
+          <div style={{ background:"#FEF2F2", border:"1px solid #FCA5A5", borderRadius:8, padding:"10px 14px", marginBottom:16, fontSize:13, color:"#B91C1C" }}>
+            {authError}
+          </div>
+        )}
+        <input
+          type="text" inputMode="numeric" maxLength={6} placeholder="קוד 6 ספרות" value={authOtp}
+          onChange={e => setAuthOtp(e.target.value.replace(/\D/g, ""))}
+          onKeyDown={e => e.key === "Enter" && handleMfaChallenge()}
+          style={{ width:"100%", padding:"14px", border:"1px solid #D1D5DB", borderRadius:8, fontSize:22, marginBottom:16, boxSizing:"border-box", textAlign:"center", letterSpacing:8, fontWeight:700 }}
+        />
+        <button onClick={handleMfaChallenge} disabled={authBusy || authOtp.length !== 6} style={{ width:"100%", padding:"12px 0", background:"#7C3AED", color:"#fff", border:"none", borderRadius:10, fontWeight:700, fontSize:15, cursor:(authOtp.length!==6||authBusy)?"not-allowed":"pointer", opacity:authOtp.length!==6?0.5:1 }}>
+          {authBusy ? "מאמת..." : "אמת"}
+        </button>
+      </div>
+    </div>
+  );
+
+  if (authPhase === "mfa-enroll") return (
+    <div style={{ display:"flex", alignItems:"center", justifyContent:"center", minHeight:"100vh", background:"#F9FAFB", fontFamily:"'Heebo', sans-serif", direction:"rtl" }}>
+      <div style={{ background:"#fff", borderRadius:16, padding:40, border:"1px solid #E5E7EB", maxWidth:420, width:"100%" }}>
+        <div style={{ textAlign:"center", marginBottom:20 }}>
+          <div style={{ fontSize:36, marginBottom:8 }}>🛡️</div>
+          <div style={{ fontSize:20, fontWeight:800, color:"#7C3AED", marginBottom:4 }}>הגדרת אימות דו-שלבי</div>
+          <div style={{ fontSize:13, color:"#6B7280" }}>סרוק את הקוד עם Google Authenticator</div>
+        </div>
+        {totpEnroll && (
+          <div style={{ textAlign:"center", marginBottom:20 }}>
+            <img
+              src={`https://quickchart.io/qr?text=${encodeURIComponent(totpEnroll.uri)}&size=200&margin=2`}
+              alt="QR Code" width={200} height={200}
+              style={{ borderRadius:8, border:"1px solid #E5E7EB" }}
+            />
+            <div style={{ marginTop:10, fontSize:11, color:"#9CA3AF" }}>
+              לא יכול לסרוק?{" "}
+              <button onClick={() => navigator.clipboard?.writeText(totpEnroll.uri)} style={{ background:"none", border:"none", color:"#7C3AED", cursor:"pointer", fontSize:11, textDecoration:"underline" }}>
+                העתק קוד ידני
+              </button>
+            </div>
+          </div>
+        )}
+        {authError && (
+          <div style={{ background:"#FEF2F2", border:"1px solid #FCA5A5", borderRadius:8, padding:"10px 14px", marginBottom:16, fontSize:13, color:"#B91C1C" }}>
+            {authError}
+          </div>
+        )}
+        <div style={{ fontSize:13, color:"#374151", marginBottom:10, textAlign:"center" }}>הזן את הקוד מהאפליקציה לאישור</div>
+        <input
+          type="text" inputMode="numeric" maxLength={6} placeholder="קוד 6 ספרות" value={authOtp}
+          onChange={e => setAuthOtp(e.target.value.replace(/\D/g, ""))}
+          onKeyDown={e => e.key === "Enter" && handleMfaEnroll()}
+          style={{ width:"100%", padding:"14px", border:"1px solid #D1D5DB", borderRadius:8, fontSize:22, marginBottom:16, boxSizing:"border-box", textAlign:"center", letterSpacing:8, fontWeight:700 }}
+        />
+        <button onClick={handleMfaEnroll} disabled={authBusy || authOtp.length !== 6} style={{ width:"100%", padding:"12px 0", background:"#7C3AED", color:"#fff", border:"none", borderRadius:10, fontWeight:700, fontSize:15, cursor:(authOtp.length!==6||authBusy)?"not-allowed":"pointer", opacity:authOtp.length!==6?0.5:1 }}>
+          {authBusy ? "מפעיל..." : "אשר והפעל"}
         </button>
       </div>
     </div>
