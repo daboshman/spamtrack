@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef } from "react";
 import { db, auth } from "./src/firebase";
 import { doc, getDoc, setDoc } from "firebase/firestore";
-import { GoogleAuthProvider, signInWithPopup, signOut, onAuthStateChanged, signInWithEmailAndPassword, createUserWithEmailAndPassword } from "firebase/auth";
+import { GoogleAuthProvider, signInWithPopup, signInWithRedirect, getRedirectResult, signOut, onAuthStateChanged, signInWithEmailAndPassword, createUserWithEmailAndPassword } from "firebase/auth";
 
 // ─── DATA ────────────────────────────────────────────────────────────────────
 
@@ -1390,25 +1390,25 @@ export default function App() {
   };
 
   useEffect(() => {
+    getRedirectResult(auth).catch((err) => {
+      if (err?.code && err.code !== "auth/no-current-user") {
+        setAuthError(translateError(err.code));
+      }
+    });
     return onAuthStateChanged(auth, (u) => {
       setUser(u ?? null);
       setAuthPhase(u ? "app" : "login");
     });
   }, []);
 
-  const handleGoogleLogin = async () => {
+  const handleGoogleLogin = () => {
     setAuthBusy(true);
     setAuthError(null);
-    try {
-      const provider = new GoogleAuthProvider();
-      await signInWithPopup(auth, provider);
-    } catch (err) {
-      if (err.code !== "auth/popup-closed-by-user" && err.code !== "auth/cancelled-popup-request") {
-        setAuthError(translateError(err.code));
-      }
-    } finally {
+    const provider = new GoogleAuthProvider();
+    signInWithRedirect(auth, provider).catch((err) => {
+      setAuthError(translateError(err.code));
       setAuthBusy(false);
-    }
+    });
   };
 
   const handleEmailLogin = async () => {
