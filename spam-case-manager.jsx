@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef } from "react";
 import { db, auth } from "./src/firebase";
 import { doc, getDoc, setDoc } from "firebase/firestore";
-import { GoogleAuthProvider, signInWithPopup, signOut, onAuthStateChanged, signInWithEmailAndPassword, TotpMultiFactorGenerator, getMultiFactorResolver, multiFactor } from "firebase/auth";
+import { GoogleAuthProvider, signInWithPopup, signOut, onAuthStateChanged, signInWithEmailAndPassword, createUserWithEmailAndPassword, TotpMultiFactorGenerator, getMultiFactorResolver, multiFactor } from "firebase/auth";
 
 // ─── DATA ────────────────────────────────────────────────────────────────────
 
@@ -1423,7 +1423,9 @@ export default function App() {
         setAuthPhase("mfa-enroll");
       } catch (err) {
         console.error(err);
-        setAuthError("TOTP אינו מופעל בפרויקט Firebase — הפעל אותו ונסה שוב");
+        await signOut(auth);
+        setPendingUser(null);
+        setAuthError("TOTP אינו מופעל עדיין — הפעל אותו בפרויקט Firebase ונסה שוב");
       }
     }
   };
@@ -1452,7 +1454,16 @@ export default function App() {
     setAuthBusy(true);
     setAuthError(null);
     try {
-      const result = await signInWithEmailAndPassword(auth, authEmail, authPassword);
+      let result;
+      try {
+        result = await signInWithEmailAndPassword(auth, authEmail, authPassword);
+      } catch (signInErr) {
+        if (signInErr.code === "auth/user-not-found" || signInErr.code === "auth/invalid-credential") {
+          result = await createUserWithEmailAndPassword(auth, authEmail, authPassword);
+        } else {
+          throw signInErr;
+        }
+      }
       await checkEnrollment(result.user);
     } catch (err) {
       if (err.code === "auth/multi-factor-auth-required") {
