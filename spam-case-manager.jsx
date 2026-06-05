@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef } from "react";
 import { db, auth } from "./src/firebase";
 import { doc, getDoc, setDoc } from "firebase/firestore";
-import { GoogleAuthProvider, signInWithPopup, signOut, onAuthStateChanged, signInWithEmailAndPassword, createUserWithEmailAndPassword, TotpMultiFactorGenerator, getMultiFactorResolver, multiFactor } from "firebase/auth";
+import { GoogleAuthProvider, signInWithPopup, signOut, onAuthStateChanged, signInWithEmailAndPassword, createUserWithEmailAndPassword } from "firebase/auth";
 
 // ─── DATA ────────────────────────────────────────────────────────────────────
 
@@ -1361,8 +1361,11 @@ function translateError(code) {
     "auth/too-many-requests": "יותר מדי ניסיונות, נסה מאוחר יותר",
     "auth/network-request-failed": "שגיאת רשת",
     "auth/user-disabled": "חשבון זה הושבת",
+    "auth/operation-not-allowed": "כניסה עם אימייל/סיסמה לא מופעלת — הפעל בהגדרות Firebase",
+    "auth/email-already-in-use": "כתובת אימייל כבר בשימוש",
+    "auth/weak-password": "הסיסמה חלשה מדי (מינימום 6 תווים)",
   };
-  return m[code] ?? "שגיאת כניסה, נסה שוב";
+  return m[code] ?? `שגיאת כניסה (${code})`;
 }
 
 export default function App() {
@@ -1372,16 +1375,11 @@ export default function App() {
   const [filterStage, setFilterStage] = useState("all");
   const [search, setSearch] = useState("");
   const [user, setUser] = useState(null);
-  const [pendingUser, setPendingUser] = useState(null);
   const [authPhase, setAuthPhase] = useState("loading");
   const [authEmail, setAuthEmail] = useState("");
   const [authPassword, setAuthPassword] = useState("");
-  const [authOtp, setAuthOtp] = useState("");
   const [authError, setAuthError] = useState(null);
   const [authBusy, setAuthBusy] = useState(false);
-  const [mfaResolver, setMfaResolver] = useState(null);
-  const [totpEnroll, setTotpEnroll] = useState(null);
-  const freshPageLoad = useRef(true);
   const [loaded, setLoaded] = useState(false);
   const [gmailToken, setGmailToken] = useState(null);
   const [signature, setSignature] = useState(() => localStorage.getItem("spamtrack_sig") ?? null);
@@ -1392,56 +1390,20 @@ export default function App() {
   };
 
   useEffect(() => {
-    return onAuthStateChanged(auth, async (u) => {
-      if (u) {
-        if (freshPageLoad.current) {
-          freshPageLoad.current = false;
-          await signOut(auth);
-        }
-        // Don't setUser here — auth handlers set it only after TOTP verification
-      } else {
-        freshPageLoad.current = false;
-        setUser(null);
-        setPendingUser(null);
-        setAuthPhase("login");
-      }
+    return onAuthStateChanged(auth, (u) => {
+      setUser(u ?? null);
+      setAuthPhase(u ? "app" : "login");
     });
   }, []);
-
-  const checkEnrollment = async (u) => {
-    setPendingUser(u);
-    const hasTotpEnrolled = u.multiFactor.enrolledFactors.some(f => f.factorId === "totp");
-    if (hasTotpEnrolled) {
-      setUser(u);
-      setAuthPhase("app");
-    } else {
-      try {
-        const session = await u.multiFactor.getSession();
-        const secret = await TotpMultiFactorGenerator.generateSecret(session);
-        const uri = secret.generateQrCodeUrl(u.email, "SpamTrack");
-        setTotpEnroll({ secret, uri });
-        setAuthPhase("mfa-enroll");
-      } catch (err) {
-        console.error(err);
-        await signOut(auth);
-        setPendingUser(null);
-        setAuthError("TOTP אינו מופעל עדיין — הפעל אותו בפרויקט Firebase ונסה שוב");
-      }
-    }
-  };
 
   const handleGoogleLogin = async () => {
     setAuthBusy(true);
     setAuthError(null);
     try {
       const provider = new GoogleAuthProvider();
-      const result = await signInWithPopup(auth, provider);
-      await checkEnrollment(result.user);
+      await signInWithPopup(auth, provider);
     } catch (err) {
-      if (err.code === "auth/multi-factor-auth-required") {
-        setMfaResolver(getMultiFactorResolver(auth, err));
-        setAuthPhase("mfa-challenge");
-      } else if (err.code !== "auth/popup-closed-by-user" && err.code !== "auth/cancelled-popup-request") {
+      if (err.code !== "auth/popup-closed-by-user" && err.code !== "auth/cancelled-popup-request") {
         setAuthError(translateError(err.code));
       }
     } finally {
@@ -1454,59 +1416,17 @@ export default function App() {
     setAuthBusy(true);
     setAuthError(null);
     try {
-      let result;
       try {
-        result = await signInWithEmailAndPassword(auth, authEmail, authPassword);
+        await signInWithEmailAndPassword(auth, authEmail, authPassword);
       } catch (signInErr) {
         if (signInErr.code === "auth/user-not-found" || signInErr.code === "auth/invalid-credential") {
-          result = await createUserWithEmailAndPassword(auth, authEmail, authPassword);
+          await createUserWithEmailAndPassword(auth, authEmail, authPassword);
         } else {
           throw signInErr;
         }
       }
-      await checkEnrollment(result.user);
     } catch (err) {
-      if (err.code === "auth/multi-factor-auth-required") {
-        setMfaResolver(getMultiFactorResolver(auth, err));
-        setAuthPhase("mfa-challenge");
-      } else {
-        setAuthError(translateError(err.code));
-      }
-    } finally {
-      setAuthBusy(false);
-    }
-  };
-
-  const handleMfaChallenge = async () => {
-    if (!authOtp) return;
-    setAuthBusy(true);
-    setAuthError(null);
-    try {
-      const hint = mfaResolver.hints.find(h => h.factorId === TotpMultiFactorGenerator.FACTOR_ID);
-      const assertion = TotpMultiFactorGenerator.assertionForSignIn(hint.uid, authOtp.trim());
-      const result = await mfaResolver.resolveSignIn(assertion);
-      setUser(result.user);
-      setAuthPhase("app");
-      setAuthOtp("");
-    } catch {
-      setAuthError("קוד שגוי, נסה שוב");
-    } finally {
-      setAuthBusy(false);
-    }
-  };
-
-  const handleMfaEnroll = async () => {
-    if (!authOtp || !totpEnroll || !pendingUser) return;
-    setAuthBusy(true);
-    setAuthError(null);
-    try {
-      const assertion = TotpMultiFactorGenerator.assertionForEnrollment(totpEnroll.secret, authOtp.trim());
-      await multiFactor(pendingUser).enroll(assertion, "Google Authenticator");
-      setUser(pendingUser);
-      setAuthPhase("app");
-      setAuthOtp("");
-    } catch {
-      setAuthError("קוד שגוי, נסה שוב");
+      setAuthError(translateError(err.code));
     } finally {
       setAuthBusy(false);
     }
@@ -1514,13 +1434,9 @@ export default function App() {
 
   const handleLogout = async () => {
     setLoaded(false);
-    setPendingUser(null);
     setAuthEmail("");
     setAuthPassword("");
-    setAuthOtp("");
     setAuthError(null);
-    setMfaResolver(null);
-    setTotpEnroll(null);
     await signOut(auth);
   };
 
@@ -1611,74 +1527,6 @@ export default function App() {
         />
         <button onClick={handleEmailLogin} disabled={authBusy || !authEmail || !authPassword} style={{ width:"100%", padding:"12px 0", background:"#7C3AED", color:"#fff", border:"none", borderRadius:10, fontWeight:700, fontSize:15, cursor:(!authEmail||!authPassword||authBusy)?"not-allowed":"pointer", opacity:(!authEmail||!authPassword)?0.5:1 }}>
           כניסה
-        </button>
-      </div>
-    </div>
-  );
-
-  if (authPhase === "mfa-challenge") return (
-    <div style={{ display:"flex", alignItems:"center", justifyContent:"center", minHeight:"100vh", background:"#F9FAFB", fontFamily:"'Heebo', sans-serif", direction:"rtl" }}>
-      <div style={{ background:"#fff", borderRadius:16, padding:40, border:"1px solid #E5E7EB", maxWidth:380, width:"100%" }}>
-        <div style={{ textAlign:"center", marginBottom:24 }}>
-          <div style={{ fontSize:36, marginBottom:8 }}>🔐</div>
-          <div style={{ fontSize:20, fontWeight:800, color:"#7C3AED", marginBottom:4 }}>אימות דו-שלבי</div>
-          <div style={{ fontSize:13, color:"#9CA3AF" }}>פתח את Google Authenticator והזן את הקוד</div>
-        </div>
-        {authError && (
-          <div style={{ background:"#FEF2F2", border:"1px solid #FCA5A5", borderRadius:8, padding:"10px 14px", marginBottom:16, fontSize:13, color:"#B91C1C" }}>
-            {authError}
-          </div>
-        )}
-        <input
-          type="text" inputMode="numeric" maxLength={6} placeholder="קוד 6 ספרות" value={authOtp}
-          onChange={e => setAuthOtp(e.target.value.replace(/\D/g, ""))}
-          onKeyDown={e => e.key === "Enter" && handleMfaChallenge()}
-          style={{ width:"100%", padding:"14px", border:"1px solid #D1D5DB", borderRadius:8, fontSize:22, marginBottom:16, boxSizing:"border-box", textAlign:"center", letterSpacing:8, fontWeight:700 }}
-        />
-        <button onClick={handleMfaChallenge} disabled={authBusy || authOtp.length !== 6} style={{ width:"100%", padding:"12px 0", background:"#7C3AED", color:"#fff", border:"none", borderRadius:10, fontWeight:700, fontSize:15, cursor:(authOtp.length!==6||authBusy)?"not-allowed":"pointer", opacity:authOtp.length!==6?0.5:1 }}>
-          {authBusy ? "מאמת..." : "אמת"}
-        </button>
-      </div>
-    </div>
-  );
-
-  if (authPhase === "mfa-enroll") return (
-    <div style={{ display:"flex", alignItems:"center", justifyContent:"center", minHeight:"100vh", background:"#F9FAFB", fontFamily:"'Heebo', sans-serif", direction:"rtl" }}>
-      <div style={{ background:"#fff", borderRadius:16, padding:40, border:"1px solid #E5E7EB", maxWidth:420, width:"100%" }}>
-        <div style={{ textAlign:"center", marginBottom:20 }}>
-          <div style={{ fontSize:36, marginBottom:8 }}>🛡️</div>
-          <div style={{ fontSize:20, fontWeight:800, color:"#7C3AED", marginBottom:4 }}>הגדרת אימות דו-שלבי</div>
-          <div style={{ fontSize:13, color:"#6B7280" }}>סרוק את הקוד עם Google Authenticator</div>
-        </div>
-        {totpEnroll && (
-          <div style={{ textAlign:"center", marginBottom:20 }}>
-            <img
-              src={`https://quickchart.io/qr?text=${encodeURIComponent(totpEnroll.uri)}&size=200&margin=2`}
-              alt="QR Code" width={200} height={200}
-              style={{ borderRadius:8, border:"1px solid #E5E7EB" }}
-            />
-            <div style={{ marginTop:10, fontSize:11, color:"#9CA3AF" }}>
-              לא יכול לסרוק?{" "}
-              <button onClick={() => navigator.clipboard?.writeText(totpEnroll.uri)} style={{ background:"none", border:"none", color:"#7C3AED", cursor:"pointer", fontSize:11, textDecoration:"underline" }}>
-                העתק קוד ידני
-              </button>
-            </div>
-          </div>
-        )}
-        {authError && (
-          <div style={{ background:"#FEF2F2", border:"1px solid #FCA5A5", borderRadius:8, padding:"10px 14px", marginBottom:16, fontSize:13, color:"#B91C1C" }}>
-            {authError}
-          </div>
-        )}
-        <div style={{ fontSize:13, color:"#374151", marginBottom:10, textAlign:"center" }}>הזן את הקוד מהאפליקציה לאישור</div>
-        <input
-          type="text" inputMode="numeric" maxLength={6} placeholder="קוד 6 ספרות" value={authOtp}
-          onChange={e => setAuthOtp(e.target.value.replace(/\D/g, ""))}
-          onKeyDown={e => e.key === "Enter" && handleMfaEnroll()}
-          style={{ width:"100%", padding:"14px", border:"1px solid #D1D5DB", borderRadius:8, fontSize:22, marginBottom:16, boxSizing:"border-box", textAlign:"center", letterSpacing:8, fontWeight:700 }}
-        />
-        <button onClick={handleMfaEnroll} disabled={authBusy || authOtp.length !== 6} style={{ width:"100%", padding:"12px 0", background:"#7C3AED", color:"#fff", border:"none", borderRadius:10, fontWeight:700, fontSize:15, cursor:(authOtp.length!==6||authBusy)?"not-allowed":"pointer", opacity:authOtp.length!==6?0.5:1 }}>
-          {authBusy ? "מפעיל..." : "אשר והפעל"}
         </button>
       </div>
     </div>
